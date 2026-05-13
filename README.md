@@ -1,0 +1,28 @@
+# Endfield BetterBuffBar
+
+[English](README_EN.md) | 中文
+
+为《明日方舟：终末地》的战斗 HUD 增强 buff/debuff 图标显示功能。当鼠标悬停在状态栏的 buff 图标上时，会显示buff的详情面板，可快速查看该状态的精确持续时间、层数以及具体的属性加减数值（例如：+10.0% 攻击力、+9.0%法术增幅等）。
+
+## 安装
+
+将以下文件复制到游戏目录（`Endfield.exe` 所在文件夹）：
+
+```
+bin/better_buff_bar.dll  → 游戏目录/plugin/better_buff_bar.dll
+bin/vulkan-1.dll         → 游戏目录/vulkan-1.dll
+bin/d3dcompiler_47.dll   → 游戏目录/d3dcompiler_47.dll
+```
+
+> **注意**：`d3dcompiler_47.dll`（DX环境）和 `vulkan-1.dll`（Vulkan环境）为代理加载器，二者放其一或全放均可。如果你同时在使用其他共用的代理加载器插件（如 AntiKick 或 SynchroFocus），无需重复放置代理加载器。
+
+## 使用方法
+
+1. 按上述方式安装后启动游戏。
+2. 进入战斗场景，待状态栏出现 buff/debuff 图标后，将鼠标悬停在对应图标上。
+3. 悬停时会自动弹出该状态的属性详情面板。面板支持多分辨率动态缩放，适配 720p - 4K 屏幕。
+
+## 免责声明
+
+本项目仅供学习和研究目的。使用本工具可能违反游戏服务条款，存在账号封禁风险。
+请在测试账号上使用，风险自负。

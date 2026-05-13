@@ -1,0 +1,24 @@
+# Build output
+bin/
+*.obj
+*.exp
+*.pdb
+*.ilk
+*.res
+
+# Linker output in root (not in deps/)
+/*.lib
+
+# IDE
+.vs/
+*.suo
+*.user
+
+# Logs
+*.log
+
+# Release archives
+*.zip
+
+# Development debug tools
+src/f9_dump.h
