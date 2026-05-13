@@ -42,16 +42,36 @@ static const CharEntry g_charNames[] = {
 // e.g. "buff_chr_0011_seraph_ultimate_effect_2" -> "赛希-终结技"
 // ============================================================================
 
-// Skill type suffix patterns
+// Skill type suffix patterns (longer/compound patterns first!)
 struct SkillSuffix { const char *pat; const char *label; };
 static const SkillSuffix g_skillTypes[] = {
+  // Compound patterns (must come before short ones)
+  {"_ultimateshield", "-\xe7\xbb\x88\xe7\xbb\x93\xe6\x8a\x80\xe6\x8a\xa4\xe7\x9b\xbe"}, // -终结技护盾
+  {"_skillshield",    "-\xe6\x88\x98\xe6\x8a\x80\xe6\x8a\xa4\xe7\x9b\xbe"},               // -战技护盾
+  {"_comboshield",    "-\xe8\xbf\x9e\xe6\x90\xba\xe6\x8a\xa4\xe7\x9b\xbe"},               // -连携护盾
+  {"_talentshield",   "-\xe5\xa4\xa9\xe8\xb5\x8b\xe6\x8a\xa4\xe7\x9b\xbe"},               // -天赋护盾
+  // Simple patterns
   {"_ultimate",  "-\xe7\xbb\x88\xe7\xbb\x93\xe6\x8a\x80"},   // -终结技
   {"_skill",     "-\xe6\x88\x98\xe6\x8a\x80"},               // -战技
   {"_combo",     "-\xe8\xbf\x9e\xe6\x90\xba"},               // -连携
   {"_talent",    "-\xe5\xa4\xa9\xe8\xb5\x8b"},               // -天赋
   {"_normal",    "-\xe6\x99\xae\xe6\x94\xbb"},               // -普攻
   {"_passive",   "-\xe8\xa2\xab\xe5\x8a\xa8"},               // -被动
+  {"_shield",    "-\xe6\x8a\xa4\xe7\x9b\xbe"},               // -护盾
 };
+
+// Check if pattern appears at a word boundary in suffix
+// (pattern must be followed by '_', '\0', or be the end of a known compound)
+static const char* FindSuffixPattern(const char* suffix, const char* pat) {
+  size_t patLen = strlen(pat);
+  const char *p = suffix;
+  while ((p = strstr(p, pat)) != nullptr) {
+    char next = p[patLen];
+    if (next == '_' || next == '\0') return p;
+    p += patLen;
+  }
+  return nullptr;
+}
 
 static bool ExtractBuffName(const char* buffId, char* out, int outSz) {
   // buff_chr_XXXX_<charcode>_<skilltype>_...
@@ -67,9 +87,13 @@ static bool ExtractBuffName(const char* buffId, char* out, int outSz) {
       strncpy(out, c.name, outSz - 1);
       out[outSz - 1] = '\0';
       // Try to append skill type from remaining suffix
-      const char *suffix = p + len; // e.g. "_ultimate_effect_2"
+      const char *suffix = p + len; // e.g. "_ultimateshield" or "_ultimate_effect_2"
       for (auto &s : g_skillTypes) {
-        if (strstr(suffix, s.pat)) {
+        // Compound patterns (no separator) use strstr directly
+        // Simple patterns require word boundary
+        bool isCompound = (strstr(s.pat, "shield") != nullptr && strlen(s.pat) > 7);
+        const char *match = isCompound ? strstr(suffix, s.pat) : FindSuffixPattern(suffix, s.pat);
+        if (match) {
           size_t cur = strlen(out);
           strncpy(out + cur, s.label, outSz - 1 - cur);
           out[outSz - 1] = '\0';
