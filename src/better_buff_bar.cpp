@@ -532,6 +532,26 @@ LRESULT CALLBACK OverlayWndProc(HWND hwnd, UINT msg, WPARAM wParam,
           tooltip_cat(buf); \
         }
 
+      // Filter out uniform scale arrays (all entries same value = internal engine factor, not per-attr)
+      auto isUniformScale = [](float *arr, int len) -> bool {
+        float first = 0.0f;
+        bool found = false;
+        for (int i = 0; i < len; i++) {
+          if (arr[i] != 0.0f && arr[i] != 1.0f) {
+            if (!found) { first = arr[i]; found = true; }
+            else if (arr[i] != first) return false;
+          }
+        }
+        // Uniform if we found 10+ identical non-trivial values
+        int cnt = 0;
+        if (found) for (int i = 0; i < len; i++) if (arr[i] == first) cnt++;
+        return found && cnt >= 10;
+      };
+      if (isUniformScale(ab.attrs.mul, 94))         memset(ab.attrs.mul, 0, sizeof(ab.attrs.mul));
+      if (isUniformScale(ab.attrs.finalScl, 94))     memset(ab.attrs.finalScl, 0, sizeof(ab.attrs.finalScl));
+      if (isUniformScale(ab.attrs.baseFinalScl, 94)) memset(ab.attrs.baseFinalScl, 0, sizeof(ab.attrs.baseFinalScl));
+      if (isUniformScale(ab.attrs.baseMul, 94))      memset(ab.attrs.baseMul, 0, sizeof(ab.attrs.baseMul));
+
       for (int j = 0; j < 94; j++) {
         // 4 additive arrays - flat values
         SHOW_ADD(baseAdd,     "\xe5\x9f\xba\xe7\xa1\x80")
