@@ -285,6 +285,15 @@ LRESULT CALLBACK OverlayWndProc(HWND hwnd, UINT msg, WPARAM wParam,
       return 0;
     }
 
+    // Hide overlay if game is not in foreground (prevents taskbar hiding/blocking when alt-tabbed)
+    HWND fg = GetForegroundWindow();
+    if (fg != g_gameHwnd && fg != hwnd) {
+      if (IsWindowVisible(hwnd)) ShowWindow(hwnd, SW_HIDE);
+      return 0;
+    } else {
+      if (!IsWindowVisible(hwnd)) ShowWindow(hwnd, SW_SHOWNA);
+    }
+
     // Sync overlay position with game window
     RECT gr;
     GetClientRect(g_gameHwnd, &gr);
@@ -1102,7 +1111,7 @@ DWORD WINAPI OverlayThread(LPVOID) {
   ClientToScreen(g_gameHwnd, &pt);
 
   g_overlayHwnd = CreateWindowExA(
-      WS_EX_LAYERED | WS_EX_TRANSPARENT | WS_EX_TOPMOST | WS_EX_NOACTIVATE,
+      WS_EX_LAYERED | WS_EX_TRANSPARENT | WS_EX_TOPMOST | WS_EX_NOACTIVATE | WS_EX_TOOLWINDOW,
       wc.lpszClassName, "", WS_POPUP | WS_VISIBLE, pt.x, pt.y, clientRect.right,
       clientRect.bottom, NULL, NULL, wc.hInstance, NULL);
   SetLayeredWindowAttributes(g_overlayHwnd, RGB(0, 0, 0), 0, LWA_COLORKEY);
