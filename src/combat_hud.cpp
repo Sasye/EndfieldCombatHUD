@@ -1237,7 +1237,7 @@ DWORD WINAPI MainThread(LPVOID) {
     d = d.substr(0, pos + 1);
   g_logFile = fopen((d + "plugin\\buff_sniff_log.txt").c_str(), "w");
 
-  Log("=== EndfieldBetterBuffBar Phase 2d: Lightweight Overlay ===");
+  Log("=== EndfieldCombatHUD Phase 2d: Lightweight Overlay ===");
   for (int i = 0; i < 120; i++) {
     if (GetModuleHandleW(L"GameAssembly.dll"))
       break;

@@ -49,11 +49,11 @@ echo.
 
 if not exist bin mkdir bin
 
-:: Build combat_hud.dll
+:: Build EndfieldCombatHUD.dll
 echo [1/4] Compiling version resource ...
 rc /nologo /fo bin\version.res src\version.rc
 
-echo [2/4] Building combat_hud.dll ...
+echo [2/4] Building EndfieldCombatHUD.dll ...
 cl /nologo /utf-8 /O2 /MD /LD /EHsc /std:c++17 ^
     /Ideps\minhook_lib\include ^
     src\combat_hud.cpp ^
@@ -61,15 +61,15 @@ cl /nologo /utf-8 /O2 /MD /LD /EHsc /std:c++17 ^
     deps\minhook_lib\lib\libMinHook.x64.lib ^
     user32.lib ^
     gdi32.lib ^
-    /Fe"bin\combat_hud.dll" ^
+    /Fe"bin\EndfieldCombatHUD.dll" ^
     /link /DLL
 
 if %errorlevel% neq 0 (
-    echo [ERROR] combat_hud.dll build failed!
+    echo [ERROR] EndfieldCombatHUD.dll build failed!
     pause
     exit /b 1
 )
-echo [OK] combat_hud.dll built successfully
+echo [OK] EndfieldCombatHUD.dll built successfully
 echo.
 
 :: Build d3dcompiler_47.dll (proxy loader)
@@ -103,9 +103,9 @@ echo [OK] vulkan-1.dll built successfully
 echo.
 
 :: Clean up intermediate files
-del /q combat_hud.obj 2>nul
-del /q combat_hud.exp 2>nul
-del /q combat_hud.lib 2>nul
+del /q EndfieldCombatHUD.obj 2>nul
+del /q EndfieldCombatHUD.exp 2>nul
+del /q EndfieldCombatHUD.lib 2>nul
 del /q proxy_d3dcompiler.obj 2>nul
 del /q proxy_d3dcompiler.exp 2>nul
 del /q proxy_d3dcompiler.lib 2>nul
@@ -118,7 +118,7 @@ echo   Build Complete!
 echo ==========================================
 echo.
 echo Output files in bin\:
-echo   - combat_hud.dll        (combat HUD / buff tooltip plugin)
+echo   - EndfieldCombatHUD.dll        (combat HUD / buff tooltip plugin)
 echo   - d3dcompiler_47.dll    (DX proxy loader)
 echo   - vulkan-1.dll          (Vulkan proxy loader)
 echo.
