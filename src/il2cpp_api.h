@@ -98,6 +98,7 @@ static bool Resolve() {
   R(il2cpp_class_get_fields);
   R(il2cpp_field_get_name);
   R(il2cpp_field_get_offset);
+  R(il2cpp_field_get_flags);
   R(il2cpp_runtime_invoke);
   R(il2cpp_class_get_parent);
   R(il2cpp_field_static_get_value);

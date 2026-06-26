@@ -32,6 +32,7 @@ void Log(const char *fmt, ...) {
 #include "buff_data.h"
 #include "attr_names.h"
 #include "buff_names.h"
+#include "skill_data.h"
 // #include "f9_dump.h"
 
 // ============================================================================
@@ -271,6 +272,8 @@ LRESULT CALLBACK OverlayWndProc(HWND hwnd, UINT msg, WPARAM wParam,
     DeleteObject(clearBrush);
     // Draw tooltip on top (non-black pixels will be visible)
     DrawTooltip(hdc);
+    // Draw skill HUD (synchro CD + ultimate charge)
+    DrawSkillHud(hdc, hwnd);
     EndPaint(hwnd, &ps);
     return 0;
   }
@@ -637,7 +640,8 @@ LRESULT CALLBACK OverlayWndProc(HWND hwnd, UINT msg, WPARAM wParam,
             {"natural_enhance", "\xe8\x87\xaa\xe7\x84\xb6\xe5\xa2\x9e\xe5\xb9\x85"},
             {"nature_enhance", "\xe8\x87\xaa\xe7\x84\xb6\xe5\xa2\x9e\xe5\xb9\x85"},
             {"enhance_nature", "\xe8\x87\xaa\xe7\x84\xb6\xe5\xa2\x9e\xe5\xb9\x85"},
-            {"ether_enhance", "\xe4\xbb\xa5\xe5\xa4\xaa\xe5\xa2\x9e\xe5\xb9\x85"},
+            {"ether_enhance", "\xe8\xb6\x85\xe5\x9f\x9f\xe5\xa2\x9e\xe5\xb9\x85"},
+            {"enhance_ether", "\xe8\xb6\x85\xe5\x9f\x9f\xe5\xa2\x9e\xe5\xb9\x85"},
           };
           const char *sources[] = { ab.id, ab.iconName };
           for (auto src : sources) {
@@ -665,31 +669,118 @@ LRESULT CALLBACK OverlayWndProc(HWND hwnd, UINT msg, WPARAM wParam,
         }
         // Show remaining non-rate blackboard entries with semantic labels
         struct { const char *raw; const char *label; bool isPct; } keyMap[] = {
+          // === Shield ===
           {"shield_def_rate", "\xe6\x8a\xa4\xe7\x9b\xbe(\xe9\x98\xb2\xe5\xbe\xa1\xc3\x97)", false},
           {"shield_atk_rate", "\xe6\x8a\xa4\xe7\x9b\xbe(\xe6\x94\xbb\xe5\x87\xbb\xc3\x97)", false},
           {"shield_hp_rate",  "\xe6\x8a\xa4\xe7\x9b\xbe(\xe7\x94\x9f\xe5\x91\xbd\xc3\x97)", false},
           {"shield_base",     "\xe6\x8a\xa4\xe7\x9b\xbe\xe5\x9f\xba\xe7\xa1\x80\xe5\x80\xbc", false},
           {"FinalShield",     "\xe6\x8a\xa4\xe7\x9b\xbe", false},
-          {"atk_ratio",       "\xe6\x94\xbb\xe5\x87\xbb\xe5\x8a\x9b\xe6\xaf\x94\xe4\xbe\x8b", true},
-          {"def_ratio",       "\xe9\x98\xb2\xe5\xbe\xa1\xe5\x8a\x9b\xe6\xaf\x94\xe4\xbe\x8b", true},
-          {"hp_ratio",        "\xe7\x94\x9f\xe5\x91\xbd\xe6\xaf\x94\xe4\xbe\x8b", true},
+          {"shield",          "\xe6\x8a\xa4\xe7\x9b\xbe", false},
+          // === Base stat ratios ===
+          {"atk_ratio",       "\xe6\x94\xbb\xe5\x87\xbb\xe5\x8a\x9b", true},
+          {"def_ratio",       "\xe9\x98\xb2\xe5\xbe\xa1\xe5\x8a\x9b", true},
+          {"hp_ratio",        "\xe6\x9c\x80\xe5\xa4\xa7\xe7\x94\x9f\xe5\x91\xbd\xe5\x80\xbc", true},
           {"hp_percent",      "\xe7\x94\x9f\xe5\x91\xbd", true},
           {"heal_ratio",      "\xe6\xb2\xbb\xe7\x96\x97\xe6\xaf\x94\xe4\xbe\x8b", true},
           {"damage",          "\xe4\xbc\xa4\xe5\xae\xb3", false},
           {"heal",            "\xe6\xb2\xbb\xe7\x96\x97\xe9\x87\x8f", false},
-          {"shield",          "\xe6\x8a\xa4\xe7\x9b\xbe", false},
-          {"pulse_dmg_up",    "\xe7\x94\xb5\xe7\xa3\x81\xe4\xbc\xa4\xe5\xae\xb3", true},
+          // === Base stats (flat) ===
+          {"atk",             "\xe6\x94\xbb\xe5\x87\xbb\xe5\x8a\x9b", false},
+          {"def",             "\xe9\x98\xb2\xe5\xbe\xa1\xe5\x8a\x9b", false},
+          {"max_hp",          "\xe6\x9c\x80\xe5\xa4\xa7\xe7\x94\x9f\xe5\x91\xbd\xe5\x80\xbc", false},
+          {"atk_up",          "\xe6\x94\xbb\xe5\x87\xbb\xe5\x8a\x9b", true},
+          {"def_up",          "\xe9\x98\xb2\xe5\xbe\xa1\xe5\x8a\x9b", true},
+          {"hp_up",           "\xe6\x9c\x80\xe5\xa4\xa7\xe7\x94\x9f\xe5\x91\xbd\xe5\x80\xbc", true},
+          // === Speed & cooldown ===
+          {"move_speed",      "\xe7\xa7\xbb\xe5\x8a\xa8\xe9\x80\x9f\xe5\xba\xa6", true},
+          {"move_speed_scalar","\xe7\xa7\xbb\xe5\x8a\xa8\xe9\x80\x9f\xe5\xba\xa6", true},
+          {"attack_rate",     "\xe6\x94\xbb\xe5\x87\xbb\xe9\x80\x9f\xe5\xba\xa6", true},
+          {"skill_cooldown",  "\xe6\x8a\x80\xe8\x83\xbd\xe5\x86\xb7\xe5\x8d\xb4", true},
+          {"combo_cd_scalar", "\xe8\xbf\x9e\xe6\x90\xba\xe6\x8a\x80\xe5\x86\xb7\xe5\x8d\xb4", true},
+          {"combo_cd",        "\xe8\xbf\x9e\xe6\x90\xba\xe6\x8a\x80\xe5\x86\xb7\xe5\x8d\xb4", false},
+          // === Elemental damage increase ===
+          {"physical_dmg_up", "\xe7\x89\xa9\xe7\x90\x86\xe4\xbc\xa4\xe5\xae\xb3", true},
           {"fire_dmg_up",     "\xe7\x81\xab\xe7\x84\xb0\xe4\xbc\xa4\xe5\xae\xb3", true},
+          {"pulse_dmg_up",    "\xe7\x94\xb5\xe7\xa3\x81\xe4\xbc\xa4\xe5\xae\xb3", true},
           {"cryst_dmg_up",    "\xe5\xaf\x92\xe5\x86\xb7\xe4\xbc\xa4\xe5\xae\xb3", true},
           {"natural_dmg_up",  "\xe8\x87\xaa\xe7\x84\xb6\xe4\xbc\xa4\xe5\xae\xb3", true},
-          {"ether_dmg_up",    "\xe4\xbb\xa5\xe5\xa4\xaa\xe4\xbc\xa4\xe5\xae\xb3", true},
-          {"physical_dmg_up", "\xe7\x89\xa9\xe7\x90\x86\xe4\xbc\xa4\xe5\xae\xb3", true},
-          {"probability",     "\xe6\xa6\x82\xe7\x8e\x87", true},
+          {"ether_dmg_up",    "\xe8\xb6\x85\xe5\x9f\x9f\xe4\xbc\xa4\xe5\xae\xb3", true},
+          // === Skill type damage increase ===
+          {"normal_atk_dmg",  "\xe6\x99\xae\xe6\x94\xbb\xe4\xbc\xa4\xe5\xae\xb3", true},
+          {"normal_skill_dmg","\xe6\x88\x98\xe6\x8a\x80\xe4\xbc\xa4\xe5\xae\xb3", true},
+          {"combo_skill_dmg", "\xe8\xbf\x9e\xe6\x90\xba\xe6\x8a\x80\xe4\xbc\xa4\xe5\xae\xb3", true},
+          {"ult_dmg",         "\xe7\xbb\x88\xe7\xbb\x93\xe6\x8a\x80\xe4\xbc\xa4\xe5\xae\xb3", true},
+          {"dmg_scale",       "\xe4\xbc\xa4\xe5\xae\xb3\xe5\x80\x8d\xe7\x8e\x87", true},
+          // === Enhanced (增幅) per element ===
+          {"physical_enhanced","\xe7\x89\xa9\xe7\x90\x86\xe5\xa2\x9e\xe5\xb9\x85", true},
+          {"fire_enhanced",   "\xe7\x81\xab\xe7\x84\xb0\xe5\xa2\x9e\xe5\xb9\x85", true},
+          {"pulse_enhanced",  "\xe7\x94\xb5\xe7\xa3\x81\xe5\xa2\x9e\xe5\xb9\x85", true},
+          {"cryst_enhanced",  "\xe5\xaf\x92\xe5\x86\xb7\xe5\xa2\x9e\xe5\xb9\x85", true},
+          {"natural_enhanced","\xe8\x87\xaa\xe7\x84\xb6\xe5\xa2\x9e\xe5\xb9\x85", true},
+          {"ether_enhanced",  "\xe8\xb6\x85\xe5\x9f\x9f\xe5\xa2\x9e\xe5\xb9\x85", true},
+          // === Vulnerable (脆弱) per element ===
+          {"physical_vulnerable","\xe7\x89\xa9\xe7\x90\x86\xe8\x84\x86\xe5\xbc\xb1", true},
+          {"fire_vulnerable", "\xe7\x81\xab\xe7\x84\xb0\xe8\x84\x86\xe5\xbc\xb1", true},
+          {"pulse_vulnerable","\xe7\x94\xb5\xe7\xa3\x81\xe8\x84\x86\xe5\xbc\xb1", true},
+          {"cryst_vulnerable","\xe5\xaf\x92\xe5\x86\xb7\xe8\x84\x86\xe5\xbc\xb1", true},
+          {"natural_vulnerable","\xe8\x87\xaa\xe7\x84\xb6\xe8\x84\x86\xe5\xbc\xb1", true},
+          {"ether_vulnerable","\xe8\xb6\x85\xe5\x9f\x9f\xe8\x84\x86\xe5\xbc\xb1", true},
+          // === Burst damage (爆发伤害) per element ===
+          {"fire_burst_dmg",  "\xe7\x81\xab\xe7\x84\xb0\xe7\x88\x86\xe5\x8f\x91", true},
+          {"pulse_burst_dmg", "\xe7\x94\xb5\xe7\xa3\x81\xe7\x88\x86\xe5\x8f\x91", true},
+          {"cryst_burst_dmg", "\xe5\xaf\x92\xe5\x86\xb7\xe7\x88\x86\xe5\x8f\x91", true},
+          {"natural_burst_dmg","\xe8\x87\xaa\xe7\x84\xb6\xe7\x88\x86\xe5\x8f\x91", true},
+          // === Abnormal damage (异常伤害) per element ===
+          {"fire_abnormal_dmg","\xe7\x87\x83\xe7\x83\xa7\xe4\xbc\xa4\xe5\xae\xb3", true},
+          {"pulse_abnormal_dmg","\xe5\xaf\xbc\xe7\x94\xb5\xe4\xbc\xa4\xe5\xae\xb3", true},
+          {"cryst_abnormal_dmg","\xe5\x86\xbb\xe7\xbb\x93\xe4\xbc\xa4\xe5\xae\xb3", true},
+          {"natural_abnormal_dmg","\xe8\x85\x90\xe8\x9a\x80\xe4\xbc\xa4\xe5\xae\xb3", true},
+          {"inflict_dmg",     "\xe5\xbc\x82\xe5\xb8\xb8\xe4\xbc\xa4\xe5\xae\xb3", true},
+          // === Damage taken (承伤系数) ===
+          {"physical_dmg_taken","\xe7\x89\xa9\xe7\x90\x86\xe6\x89\xbf\xe4\xbc\xa4", true},
+          {"fire_dmg_taken",  "\xe7\x81\xab\xe7\x84\xb0\xe6\x89\xbf\xe4\xbc\xa4", true},
+          {"pulse_dmg_taken", "\xe7\x94\xb5\xe7\xa3\x81\xe6\x89\xbf\xe4\xbc\xa4", true},
+          {"cryst_dmg_taken", "\xe5\xaf\x92\xe5\x86\xb7\xe6\x89\xbf\xe4\xbc\xa4", true},
+          {"natural_dmg_taken","\xe8\x87\xaa\xe7\x84\xb6\xe6\x89\xbf\xe4\xbc\xa4", true},
+          {"ether_dmg_taken", "\xe8\xb6\x85\xe5\x9f\x9f\xe6\x89\xbf\xe4\xbc\xa4", true},
+          // === Resist (抗性) ===
+          {"physical_resist", "\xe7\x89\xa9\xe7\x90\x86\xe6\x8a\x97\xe6\x80\xa7", true},
+          {"fire_resist",     "\xe7\x81\xab\xe7\x84\xb0\xe6\x8a\x97\xe6\x80\xa7", true},
+          {"pulse_resist",    "\xe7\x94\xb5\xe7\xa3\x81\xe6\x8a\x97\xe6\x80\xa7", true},
+          {"cryst_resist",    "\xe5\xaf\x92\xe5\x86\xb7\xe6\x8a\x97\xe6\x80\xa7", true},
+          {"natural_resist",  "\xe8\x87\xaa\xe7\x84\xb6\xe6\x8a\x97\xe6\x80\xa7", true},
+          {"ether_resist",    "\xe8\xb6\x85\xe5\x9f\x9f\xe6\x8a\x97\xe6\x80\xa7", true},
+          // === Poise/Stagger ===
+          {"poise_dmg_up",    "\xe5\xa4\xb1\xe8\xa1\xa1\xe5\x80\xbc\xe8\xbe\x93\xe5\x87\xba", true},
+          {"poise_dmg_taken", "\xe5\xa4\xb1\xe8\xa1\xa1\xe5\x80\xbc\xe6\x89\xbf\xe5\x8f\x97", true},
+          {"broken_dmg",      "\xe5\xaf\xb9\xe5\xa4\xb1\xe8\xa1\xa1\xe7\x9b\xae\xe6\xa0\x87\xe4\xbc\xa4\xe5\xae\xb3", true},
+          {"break_dmg_taken", "\xe5\xa4\x84\xe5\x86\xb3\xe6\x89\xbf\xe4\xbc\xa4", true},
+          {"knockdown_time",  "\xe5\x80\x92\xe5\x9c\xb0\xe6\x97\xb6\xe9\x97\xb4", false},
+          // === Crit ===
           {"crit_rate",       "\xe6\x9a\xb4\xe5\x87\xbb\xe7\x8e\x87", true},
           {"crit_damage",     "\xe6\x9a\xb4\xe5\x87\xbb\xe4\xbc\xa4\xe5\xae\xb3", true},
+          // === Heal & shield output ===
+          {"heal_output",     "\xe6\xb2\xbb\xe7\x96\x97\xe6\x95\x88\xe6\x9e\x9c\xe5\x8a\xa0\xe6\x88\x90", true},
+          {"heal_taken",      "\xe8\xa2\xab\xe6\xb2\xbb\xe7\x96\x97\xe5\x8a\xa0\xe6\x88\x90", true},
+          {"shield_output",   "\xe6\x8a\xa4\xe7\x9b\xbe\xe9\x87\x8f\xe5\x8a\xa0\xe6\x88\x90", true},
+          {"shield_taken",    "\xe5\x8f\x97\xe6\x8a\xa4\xe7\x9b\xbe\xe5\x8a\xa0\xe6\x88\x90", true},
+          // === SP & ATB ===
+          {"ult_sp_gain",     "\xe7\xbb\x88\xe7\xbb\x93\xe6\x8a\x80\xe5\x85\x85\xe8\x83\xbd\xe6\x95\x88\xe7\x8e\x87", true},
+          {"atb_cost",        "\xe6\x8a\x80\xe5\x8a\x9b\xe6\xb6\x88\xe8\x80\x97", false},
+          {"life_steal",      "\xe5\x90\xb8\xe8\xa1\x80", true},
+          // === Weakness/Shelter ===
+          {"weakness_dmg",    "\xe8\x99\x9a\xe5\xbc\xb1\xe7\xb3\xbb\xe6\x95\xb0", true},
+          {"shelter_dmg",     "\xe5\xba\x87\xe6\x8a\xa4\xe7\xb3\xbb\xe6\x95\xb0", true},
+          // === Status effects ===
+          {"probability",     "\xe6\xa6\x82\xe7\x8e\x87", true},
           {"vuln_rate",       "\xe6\x98\x93\xe4\xbc\xa4", true},
           {"weaken_rate",     "\xe5\xbc\xb1\xe5\x8c\x96", true},
           {"slow_rate",       "\xe5\x87\x8f\xe9\x80\x9f", true},
+          {"slow_action",     "\xe5\x8a\xa8\xe4\xbd\x9c\xe5\x87\x8f\xe9\x80\x9f", true},
+          // === Infliction (源石技艺强度) ===
+          {"infliction_enhance","\xe6\xba\x90\xe7\x9f\xb3\xe6\x8a\x80\xe8\x89\xba\xe5\xbc\xba\xe5\xba\xa6", false},
+          // === Combo zone ===
+          {"combo_dmg",       "\xe8\xbf\x9e\xe5\x87\xbb\xe5\xa2\x9e\xe4\xbc\xa4", true},
         };
         for (int b = 0; b < ab.bbCount; b++) {
           const char *k = ab.bb[b].key;
@@ -774,6 +865,8 @@ LRESULT CALLBACK OverlayWndProc(HWND hwnd, UINT msg, WPARAM wParam,
         InvalidateRect(hwnd, NULL, TRUE);
       }
     }
+    // Always invalidate for skill HUD continuous refresh
+    InvalidateRect(hwnd, NULL, TRUE);
     return 0;
   }
   return DefWindowProc(hwnd, msg, wParam, lParam);
@@ -1264,7 +1357,16 @@ DWORD WINAPI MainThread(LPVOID) {
     Log("[WARN] AttributeType enum not found");
   }
 
+  // ========== Phase 1: Skill/Ult Class Discovery Dump ==========
+  // Comprehensive scan for synchro skill CD and ultimate charge data sources.
+  // Results are written to buff_sniff_log.txt for manual analysis.
+  DumpSkillRelatedClasses(asms, ac);
+  DumpBeyondUIClasses(asms, ac);
+  DumpBeyondGameplayClasses(asms, ac);
+
   void *hpClass = FindClass("Beyond.UI", "MainCharHpBar", asms, ac);
+  // Full MainCharHpBar dump — find skill/ult references
+  DumpMainCharHpBarFull(hpClass);
   if (MH_Initialize() != MH_OK) {
     Log("[FATAL] MH_Initialize failed");
     return 1;
@@ -1317,6 +1419,9 @@ DWORD WINAPI MainThread(LPVOID) {
   }
 
   Log("Init complete. Hooks active.");
+
+  // ========== Phase 2: Skill HUD hooks ==========
+  InitSkillHooks(asms, ac);
 
   // Start overlay thread AFTER game is fully loaded
   CreateThread(NULL, 0, OverlayThread, NULL, 0, NULL);
