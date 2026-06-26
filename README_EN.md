@@ -16,6 +16,8 @@ bin/d3dcompiler_47.dll     → Game Directory/d3dcompiler_47.dll
 
 > **Note**: `d3dcompiler_47.dll` (DirectX) and `vulkan-1.dll` (Vulkan) are proxy loaders. You only need the one matching your rendering API, or both. If you are also using other plugins that share these proxy loaders, there is no need to overwrite them.
 
+> If you have **never installed a plugin of this type before**, you may need to create the `plugin` folder yourself.
+
 ## Usage
 
 1. Launch the game after installing the files as described above.
