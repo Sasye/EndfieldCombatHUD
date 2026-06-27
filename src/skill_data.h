@@ -8,7 +8,7 @@
 #include <cstring>
 #include <windows.h>
 
-// Forward decls from better_buff_bar.cpp / il2cpp_api.h
+// Forward decls from combat_hud.cpp / il2cpp_api.h
 extern void Log(const char *fmt, ...);
 
 // ============================================================================
@@ -137,12 +137,21 @@ static volatile bool g_sceneActive = false;  // OnShow/OnHide
 static volatile bool g_combatActive = false; // _OnBattleTeamChanged/OnRelease
 static void *g_mainCharHpBarPtr = nullptr;
 
+// CanvasGroup alpha cache (file-scope so we can invalidate on restart)
+static void *s_cgGetAlpha = nullptr;
+static bool  s_cgResolved = false;
+
 // Hook: MainCharHpBar.OnShow — scene HUD appears
 typedef void (*tHpBarOnShow)(void *self, void *methodInfo);
 static tHpBarOnShow oHpBarOnShow = nullptr;
 
 void hkHpBarOnShow(void *self, void *methodInfo) {
   oHpBarOnShow(self, methodInfo);
+  // If the HpBar object changed (restart creates new instance), invalidate cache
+  if (g_mainCharHpBarPtr != nullptr && g_mainCharHpBarPtr != self) {
+    s_cgResolved = false;
+    s_cgGetAlpha = nullptr;
+  }
   g_mainCharHpBarPtr = self;
   g_sceneActive = true;
 }
@@ -160,8 +169,27 @@ void hkHpBarOnHide(void *self, void *methodInfo) {
 typedef void (*tComboPanelBattleChanged)(void *self, void *methodInfo);
 static tComboPanelBattleChanged oComboPanelBattleChanged = nullptr;
 
+// Forward-declare combo skill cache (used by hooks below, defined in CD reading section)
+static void *g_comboSkillObj[4];
+static void *g_comboAbilityPtr[4];
+static SkillSlotStatus g_comboState[4];
+
 void hkComboPanelBattleChanged(void *self, void *methodInfo) {
   oComboPanelBattleChanged(self, methodInfo);
+  // Invalidate all cached skill pointers — handles dungeon restart
+  // where game destroys and recreates all ability system objects
+  for (int i = 0; i < 4; i++) {
+    g_comboSkillObj[i] = nullptr;
+    g_comboAbilityPtr[i] = nullptr;
+    g_comboState[i] = {};
+  }
+  // Reset CG alpha cache so it re-resolves with new UI objects
+  s_cgResolved = false;
+  s_cgGetAlpha = nullptr;
+  // Clear HUD data so stale values don't persist
+  EnterCriticalSection(&g_skillLock);
+  g_skillHud = {};
+  LeaveCriticalSection(&g_skillLock);
   g_combatActive = true;
 }
 
@@ -178,10 +206,7 @@ void hkComboPanelRelease(void *self, void *methodInfo) {
 // Combo Skill CD reading — find type==6 Skill in m_skills List
 // ============================================================================
 
-static void *g_comboSkillObj[4] = {};  // cached Skill* per character
-static void *g_comboAbilityPtr[4] = {}; // abilityPtr used when resolving
-static SkillSlotStatus g_comboState[4] = {};
-
+// (combo cache variables declared above, before hooks)
 // Find the ComboSkill (type==6) from AbilitySystem.m_skills List
 static void ResolveComboSkill(void *abilityPtr, int charIdx) {
   if (!abilityPtr || charIdx < 0 || charIdx >= 4) return;
@@ -400,10 +425,8 @@ static void DrawSkillHud(HDC hdc, HWND hwnd) {
   if (g_mainCharHpBarPtr) {
     void *fadeCtrl = SReadPtr(g_mainCharHpBarPtr, 0x198);
     if (fadeCtrl) {
-      static void *s_cgGetAlpha = nullptr;
-      static bool s_resolved = false;
-      if (!s_resolved) {
-        s_resolved = true;
+      if (!s_cgResolved) {
+        s_cgResolved = true;
         void *cgObj = SReadPtr(fadeCtrl, 0x20);
         if (cgObj) {
           void *k = il2cpp_object_get_class(cgObj);
@@ -507,7 +530,7 @@ static void DrawSkillHud(HDC hdc, HWND hwnd) {
         wsprintfW(buf, L"%d.%ds", cdSec / 10, cdSec % 10);
         SetTextColor(hdc, RGB(220, 220, 220));
       }
-      COLORREF clr = s.ready ? RGB(220, 220, 220) : RGB(220, 220, 220);
+      COLORREF clr = RGB(220, 220, 220);
       RECT lr = {x, y, x + barW, y + textH};
       DrawOutlinedText(hdc, buf, &lr, DT_SINGLELINE | DT_CENTER, clr);
 
@@ -564,7 +587,7 @@ static void DrawSkillHud(HDC hdc, HWND hwnd) {
         wsprintfW(buf, L"%d%%", pct);
         SetTextColor(hdc, RGB(220, 220, 220));
       }
-      COLORREF clr = u.ready ? RGB(220, 220, 220) : RGB(220, 220, 220);
+      COLORREF clr = RGB(220, 220, 220);
       RECT lr = {x, y, x + barW, y + textH};
       DrawOutlinedText(hdc, buf, &lr, DT_SINGLELINE | DT_CENTER, clr);
 
@@ -594,228 +617,3 @@ static void DrawSkillHud(HDC hdc, HWND hwnd) {
   SelectObject(hdc, oldFont);
 }
 
-// ============================================================================
-// Phase 1: Discovery dump functions (kept for reference, can be removed later)
-// ============================================================================
-// [SEH-safe wrappers - unchanged from previous version]
-static void *SafeGetImage(void *assembly) {
-  __try { return il2cpp_assembly_get_image(assembly); }
-  __except(1) { return nullptr; }
-}
-static const char *SafeGetImageName(void *img) {
-  __try { return il2cpp_image_get_name ? il2cpp_image_get_name(img) : "?"; }
-  __except(1) { return "?"; }
-}
-static size_t SafeGetClassCount(void *img) {
-  __try { return il2cpp_image_get_class_count(img); }
-  __except(1) { return 0; }
-}
-static void *SafeGetClass(void *img, size_t idx) {
-  __try { return il2cpp_image_get_class(img, idx); }
-  __except(1) { return nullptr; }
-}
-static const char *SafeGetClassName(void *klass) {
-  __try { return il2cpp_class_get_name(klass); }
-  __except(1) { return nullptr; }
-}
-static const char *SafeGetClassNamespace(void *klass) {
-  __try { return il2cpp_class_get_namespace ? il2cpp_class_get_namespace(klass) : ""; }
-  __except(1) { return ""; }
-}
-static void *SafeGetParent(void *klass) {
-  __try { return il2cpp_class_get_parent ? il2cpp_class_get_parent(klass) : nullptr; }
-  __except(1) { return nullptr; }
-}
-static void *SafeGetFields(void *klass, void **iter) {
-  __try { return il2cpp_class_get_fields(klass, iter); }
-  __except(1) { return nullptr; }
-}
-static const char *SafeGetFieldName(void *field) {
-  __try { return il2cpp_field_get_name(field); }
-  __except(1) { return "?"; }
-}
-static size_t SafeGetFieldOffset(void *field) {
-  __try { return il2cpp_field_get_offset(field); }
-  __except(1) { return 0; }
-}
-static int SafeGetFieldFlags(void *field) {
-  __try { return il2cpp_field_get_flags ? il2cpp_field_get_flags(field) : 0; }
-  __except(1) { return 0; }
-}
-static void *SafeGetMethods(void *klass, void **iter) {
-  __try { return il2cpp_class_get_methods(klass, iter); }
-  __except(1) { return nullptr; }
-}
-static const char *SafeGetMethodName(void *method) {
-  __try { return il2cpp_method_get_name(method); }
-  __except(1) { return "?"; }
-}
-static uint32_t SafeGetMethodParamCount(void *method) {
-  __try { return il2cpp_method_get_param_count(method); }
-  __except(1) { return 0; }
-}
-
-static bool IsSkillRelatedName(const char *name, const char *ns) {
-  if (!name) return false;
-  auto containsCI = [](const char *haystack, const char *needle) -> bool {
-    if (!haystack || !needle) return false;
-    int hlen = (int)strlen(haystack);
-    int nlen = (int)strlen(needle);
-    if (nlen > hlen) return false;
-    for (int i = 0; i <= hlen - nlen; i++) {
-      bool match = true;
-      for (int j = 0; j < nlen; j++) {
-        char h = haystack[i + j]; char n = needle[j];
-        if (h >= 'A' && h <= 'Z') h += 32;
-        if (n >= 'A' && n <= 'Z') n += 32;
-        if (h != n) { match = false; break; }
-      }
-      if (match) return true;
-    }
-    return false;
-  };
-  static const char *keywords[] = {
-    "skill", "ultimate", "burst", "synchro", "combo",
-    "cooldown", "energy", "charge", "gauge",
-    "charslot", "teamslot", "HpBar", "ability",
-  };
-  for (auto kw : keywords) {
-    if (containsCI(name, kw)) return true;
-    if (ns && containsCI(ns, kw)) return true;
-  }
-  return false;
-}
-
-static void DumpClassFields(void *klass, const char *className) {
-  if (!klass || !il2cpp_class_get_fields || !il2cpp_field_get_name) return;
-  void *iter = nullptr; void *field; int count = 0;
-  while ((field = SafeGetFields(klass, &iter)) != nullptr) {
-    const char *fname = SafeGetFieldName(field);
-    size_t foff = SafeGetFieldOffset(field);
-    int flags = SafeGetFieldFlags(field);
-    bool isStatic = (flags & 0x10) != 0;
-    Log("    [0x%X] %s%s", (int)foff, fname ? fname : "?", isStatic ? " (static)" : "");
-    count++;
-    if (count > 200) { Log("    ... (truncated)"); break; }
-  }
-  if (count == 0) Log("    (no fields)");
-}
-
-static void DumpClassMethods(void *klass, const char *className) {
-  if (!klass || !il2cpp_class_get_methods || !il2cpp_method_get_name) return;
-  void *iter = nullptr; void *method; int count = 0;
-  while ((method = SafeGetMethods(klass, &iter)) != nullptr) {
-    const char *mname = SafeGetMethodName(method);
-    uint32_t pc = SafeGetMethodParamCount(method);
-    void *mp = nullptr;
-    __try { mp = ((MInfo *)method)->mp; } __except(1) {}
-    Log("    %s(%d params) ptr=%p", mname ? mname : "?", (int)pc, mp);
-    count++;
-    if (count > 200) { Log("    ... (truncated)"); break; }
-  }
-  if (count == 0) Log("    (no methods)");
-}
-
-static void DumpClassHierarchy(void *klass) {
-  if (!klass) return;
-  void *parent = SafeGetParent(klass); int depth = 0;
-  while (parent && depth < 10) {
-    const char *pname = SafeGetClassName(parent);
-    const char *pns = SafeGetClassNamespace(parent);
-    Log("    parent[%d]: %s.%s", depth, pns ? pns : "", pname ? pname : "?");
-    parent = SafeGetParent(parent); depth++;
-  }
-}
-
-static void DumpSkillRelatedClasses(void **assemblies, size_t assemblyCount) {
-  Log("========== SKILL/ULT CLASS DISCOVERY DUMP ==========");
-  Log("Scanning %zu assemblies for skill-related classes...", assemblyCount);
-  int totalClasses = 0, matchedClasses = 0;
-  for (size_t ai = 0; ai < assemblyCount; ai++) {
-    void *img = SafeGetImage(assemblies[ai]);
-    if (!img) continue;
-    const char *imgName = SafeGetImageName(img);
-    size_t classCount = SafeGetClassCount(img);
-    if (classCount == 0 || classCount > 100000) continue;
-    Log("  [Assembly %zu] %s: %zu classes", ai, imgName ? imgName : "?", classCount);
-    for (size_t ci = 0; ci < classCount; ci++) {
-      void *klass = SafeGetClass(img, ci);
-      if (!klass) continue;
-      const char *cname = SafeGetClassName(klass);
-      const char *cns = SafeGetClassNamespace(klass);
-      if (!cname) continue;
-      totalClasses++;
-      if (IsSkillRelatedName(cname, cns)) {
-        matchedClasses++;
-        Log("--------------------------------------");
-        Log("CLASS: %s.%s  (image: %s)", cns ? cns : "", cname, imgName ? imgName : "?");
-        Log("  [Hierarchy]"); DumpClassHierarchy(klass);
-        Log("  [Fields]"); DumpClassFields(klass, cname);
-        Log("  [Methods]"); DumpClassMethods(klass, cname);
-      }
-    }
-  }
-  Log("DISCOVERY SUMMARY: %d/%d classes matched", matchedClasses, totalClasses);
-  Log("========== END SKILL/ULT DISCOVERY ==========");
-}
-
-static void DumpMainCharHpBarFull(void *hpClass) {
-  if (!hpClass) return;
-  Log("========== MainCharHpBar FULL DUMP ==========");
-  const char *cname = SafeGetClassName(hpClass);
-  Log("CLASS: %s", cname ? cname : "?");
-  Log("  [Hierarchy]"); DumpClassHierarchy(hpClass);
-  Log("  [ALL Fields]"); DumpClassFields(hpClass, "MainCharHpBar");
-  if (il2cpp_class_get_parent) {
-    void *parent = SafeGetParent(hpClass); int depth = 0;
-    while (parent && depth < 5) {
-      const char *pname = SafeGetClassName(parent);
-      Log("  [Parent Fields: %s]", pname ? pname : "?");
-      DumpClassFields(parent, pname ? pname : "?");
-      parent = SafeGetParent(parent); depth++;
-    }
-  }
-  Log("  [ALL Methods]"); DumpClassMethods(hpClass, "MainCharHpBar");
-  Log("========== END MainCharHpBar DUMP ==========");
-}
-
-static void DumpBeyondUIClasses(void **assemblies, size_t assemblyCount) {
-  Log("========== Beyond.UI TARGETED DUMP ==========");
-  for (size_t ai = 0; ai < assemblyCount; ai++) {
-    void *img = SafeGetImage(assemblies[ai]);
-    if (!img) continue;
-    size_t classCount = SafeGetClassCount(img);
-    if (classCount == 0 || classCount > 100000) continue;
-    for (size_t ci = 0; ci < classCount; ci++) {
-      void *klass = SafeGetClass(img, ci);
-      if (!klass) continue;
-      const char *cns = SafeGetClassNamespace(klass);
-      if (!cns || strcmp(cns, "Beyond.UI") != 0) continue;
-      const char *cname = SafeGetClassName(klass);
-      if (!cname) continue;
-      Log("  Beyond.UI.%s", cname);
-    }
-  }
-  Log("========== END Beyond.UI DUMP ==========");
-}
-
-static void DumpBeyondGameplayClasses(void **assemblies, size_t assemblyCount) {
-  Log("========== Beyond.Gameplay TARGETED DUMP ==========");
-  for (size_t ai = 0; ai < assemblyCount; ai++) {
-    void *img = SafeGetImage(assemblies[ai]);
-    if (!img) continue;
-    size_t classCount = SafeGetClassCount(img);
-    if (classCount == 0 || classCount > 100000) continue;
-    for (size_t ci = 0; ci < classCount; ci++) {
-      void *klass = SafeGetClass(img, ci);
-      if (!klass) continue;
-      const char *cns = SafeGetClassNamespace(klass);
-      if (!cns) continue;
-      if (strncmp(cns, "Beyond.Gameplay", 15) != 0) continue;
-      const char *cname = SafeGetClassName(klass);
-      if (!cname) continue;
-      Log("  %s.%s", cns, cname);
-    }
-  }
-  Log("========== END Beyond.Gameplay DUMP ==========");
-}

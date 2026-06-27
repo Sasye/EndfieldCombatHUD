@@ -33,7 +33,7 @@ void Log(const char *fmt, ...) {
 #include "attr_names.h"
 #include "buff_names.h"
 #include "skill_data.h"
-// #include "f9_dump.h"
+
 
 // ============================================================================
 // Tooltip State (shared between hook thread and overlay thread)
@@ -1305,68 +1305,21 @@ DWORD WINAPI MainThread(LPVOID) {
   if (amlClass) {
     g_getAttrAdd = FindMethod(amlClass, "get_attributeAdditions", 0);
     g_getAttrMul = FindMethod(amlClass, "get_attributeMultipliers", 0);
-    // Dump all AML field offsets
-    Log("  AML fields:");
+    // Find s_attributesToModify static field (maps array index -> AttributeType)
     void* amlIter = nullptr;
     void* amlField;
     while ((amlField = il2cpp_class_get_fields(amlClass, &amlIter))) {
       const char* afname = il2cpp_field_get_name(amlField);
-      size_t afoff = il2cpp_field_get_offset(amlField);
-      Log("    [0x%X] %s", (int)afoff, afname ? afname : "?");
-      // Read s_attributesToModify static field (maps array index -> AttributeType)
       if (afname && strcmp(afname, "s_attributesToModify") == 0) {
-        g_satmField = amlField; // Save for lazy loading in LateTick
-        void* satmArr = nullptr;
-        il2cpp_field_static_get_value(amlField, &satmArr);
-        if (satmArr) {
-          int32_t sLen = *(int32_t *)((char *)satmArr + 0x18);
-          Log("    s_attributesToModify: arr=%p len=%d", satmArr, sLen);
-          if (sLen > 0 && sLen <= 96) {
-            // This is likely an int[] or AttributeType[] array
-            int32_t *sData = (int32_t *)((char *)satmArr + 0x20);
-            for (int si = 0; si < sLen; si++) {
-              Log("      satm[%d] = %d", si, sData[si]);
-            }
-          }
-        } else {
-          Log("    s_attributesToModify: null (static class may not be initialized)");
-        }
+        g_satmField = amlField;
+        break;
       }
     }
     Log("[OK] AttributeModifierLoader resolved");
   }
 
-  // Dump GEnums.AttributeType enum values
-  void *attrTypeClass = FindClass("Beyond.GEnums", "AttributeType", asms, ac);
-  if (!attrTypeClass)
-    attrTypeClass = FindClass("", "AttributeType", asms, ac);
-  if (attrTypeClass && il2cpp_field_static_get_value) {
-    Log("========== AttributeType Enum Dump ==========");
-    void *fieldIter = nullptr;
-    void *field;
-    while ((field = il2cpp_class_get_fields(attrTypeClass, &fieldIter))) {
-      const char *fname = il2cpp_field_get_name(field);
-      if (!fname || strcmp(fname, "value__") == 0)
-        continue;
-      int32_t val = 0;
-      il2cpp_field_static_get_value(field, &val);
-      Log("  [%d] %s", val, fname);
-    }
-    Log("========== End Enum Dump ==========");
-  } else {
-    Log("[WARN] AttributeType enum not found");
-  }
-
-  // ========== Phase 1: Skill/Ult Class Discovery Dump ==========
-  // Comprehensive scan for synchro skill CD and ultimate charge data sources.
-  // Results are written to buff_sniff_log.txt for manual analysis.
-  DumpSkillRelatedClasses(asms, ac);
-  DumpBeyondUIClasses(asms, ac);
-  DumpBeyondGameplayClasses(asms, ac);
 
   void *hpClass = FindClass("Beyond.UI", "MainCharHpBar", asms, ac);
-  // Full MainCharHpBar dump — find skill/ult references
-  DumpMainCharHpBarFull(hpClass);
   if (MH_Initialize() != MH_OK) {
     Log("[FATAL] MH_Initialize failed");
     return 1;
@@ -1390,16 +1343,6 @@ DWORD WINAPI MainThread(LPVOID) {
   if (buffCellClass) {
     g_getBuffInstanceUid = FindMethod(buffCellClass, "get_buffInstanceUid", 0);
     Log("[OK] UIBuffCell.get_buffInstanceUid: %p", g_getBuffInstanceUid);
-    
-    // Dump UIBuffCell fields to find the grouped buffs list
-    Log("  UIBuffCell fields:");
-    void* iter = nullptr;
-    void* f;
-    while ((f = il2cpp_class_get_fields(buffCellClass, &iter))) {
-      const char* fname = il2cpp_field_get_name(f);
-      size_t foff = il2cpp_field_get_offset(f);
-      Log("    [0x%X] %s", (int)foff, fname ? fname : "?");
-    }
   }
 
   // Resolve UIBuffNode.m_orderedBuffCellList field offset
