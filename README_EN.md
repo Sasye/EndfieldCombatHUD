@@ -7,7 +7,7 @@ Enhances the combat HUD in *Arknights: Endfield* with a detailed buff/debuff ins
 ## User Agreement & Disclaimer
 
 <details>
-<summary>Please read this agreement carefully before downloading, installing, or using this plugin (EIEM). <b>By using this plugin, you acknowledge that you have fully read, understood, and agreed to all of the following terms.</b></summary>
+<summary>Please read this agreement carefully before downloading, installing, or using this plugin. <b>By using this plugin, you acknowledge that you have fully read, understood, and agreed to all of the following terms.</b></summary>
 
 ### 1. Open Source License & End User Rights
 - This plugin is fully open-sourced on GitHub under the **AGPL-3.0** license. Users may freely use, modify, and distribute the source code of this plugin in compliance with the license.
