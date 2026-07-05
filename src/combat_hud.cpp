@@ -1,7 +1,5 @@
-#define _CRT_SECURE_NO_WARNINGS
 #include "MinHook.h"
 #include <cstdint>
-#include <cstdio>
 #include <cstring>
 #include <string>
 #include <vector>
@@ -264,22 +262,25 @@ static void DrawTooltip(HDC hdc) {
   SelectObject(hdc, (HFONT)GetStockObject(DEFAULT_GUI_FONT));
 }
 
-// Repaint flag — set by tooltip/skill change detection, consumed by ULW render
+// Repaint flag — set by tooltip/skill change detection, consumed by timer render
 static bool g_needRepaint = true;
 
-// Render overlay content via UpdateLayeredWindow (bypasses DWM dirty notifications)
+// Render overlay content directly via GetDC+BitBlt (no InvalidateRect, no WM_PAINT)
+// Transparency is handled by SetLayeredWindowAttributes(LWA_COLORKEY) set at creation.
+// This avoids both DWM dirty notifications AND ULW_COLORKEY compatibility issues.
 static void RenderOverlay(HWND hwnd) {
   RECT cr;
   GetClientRect(hwnd, &cr);
   int w = cr.right, h = cr.bottom;
   if (w <= 0 || h <= 0) return;
 
-  HDC screenDC = GetDC(NULL);
-  HDC memDC = CreateCompatibleDC(screenDC);
-  HBITMAP memBmp = CreateCompatibleBitmap(screenDC, w, h);
+  HDC winDC = GetDC(hwnd);
+  if (!winDC) return;
+  HDC memDC = CreateCompatibleDC(winDC);
+  HBITMAP memBmp = CreateCompatibleBitmap(winDC, w, h);
   HBITMAP oldBmp = (HBITMAP)SelectObject(memDC, memBmp);
 
-  // Clear to black (= transparent via ULW_COLORKEY)
+  // Clear to black (= transparent via LWA_COLORKEY)
   HBRUSH clearBrush = CreateSolidBrush(RGB(0, 0, 0));
   FillRect(memDC, &cr, clearBrush);
   DeleteObject(clearBrush);
@@ -288,35 +289,28 @@ static void RenderOverlay(HWND hwnd) {
   DrawTooltip(memDC);
   DrawSkillHud(memDC, hwnd);
 
-  // Submit completed frame — ULW_COLORKEY makes black pixels transparent
-  // This does NOT trigger DWM dirty notifications like InvalidateRect does
-  POINT ptSrc = {0, 0};
-  SIZE sz = {w, h};
-  POINT ptWin;
-  {
-    RECT wr; GetWindowRect(hwnd, &wr);
-    ptWin = {wr.left, wr.top};
-  }
-  UpdateLayeredWindow(hwnd, screenDC, &ptWin, &sz, memDC, &ptSrc,
-                      RGB(0, 0, 0), NULL, ULW_COLORKEY);
+  // Single atomic blit — no InvalidateRect, no WM_PAINT, no DWM dirty notification
+  BitBlt(winDC, 0, 0, w, h, memDC, 0, 0, SRCCOPY);
 
   SelectObject(memDC, oldBmp);
   DeleteObject(memBmp);
   DeleteDC(memDC);
-  ReleaseDC(NULL, screenDC);
+  ReleaseDC(hwnd, winDC);
 }
 
 LRESULT CALLBACK OverlayWndProc(HWND hwnd, UINT msg, WPARAM wParam,
                                 LPARAM lParam) {
   if (msg == WM_PAINT) {
-    // ULW manages rendering — just validate to suppress further WM_PAINT
-    ValidateRect(hwnd, NULL);
+    // Direct-render mode: render content here when system requests repaint
+    // (e.g. after ShowWindow restores visibility)
+    ValidateRect(hwnd, NULL); // prevent infinite WM_PAINT loop
+    RenderOverlay(hwnd);
     return 0;
   }
   if (msg == WM_ERASEBKGND)
     return 1;
   if (msg == WM_TIMER) {
-    // Timer fires ~60fps on overlay thread - do hit testing here with pure
+    // Timer fires ~30fps on overlay thread - do hit testing here with pure
     // Win32
     if (!IsWindow(g_gameHwnd)) {
       g_running = false;
@@ -324,13 +318,39 @@ LRESULT CALLBACK OverlayWndProc(HWND hwnd, UINT msg, WPARAM wParam,
       return 0;
     }
 
-    // Hide overlay if game is not in foreground (prevents taskbar hiding/blocking when alt-tabbed)
-    HWND fg = GetForegroundWindow();
-    if (fg != g_gameHwnd && fg != hwnd) {
-      if (IsWindowVisible(hwnd)) ShowWindow(hwnd, SW_HIDE);
-      return 0;
-    } else {
-      if (!IsWindowVisible(hwnd)) ShowWindow(hwnd, SW_SHOWNA);
+    // Z-order based visibility: check if the game window is covered by a
+    // regular (non-overlay) window. This correctly handles:
+    // - WeGame/TXGuiFoundation: TOPMOST overlay, doesn't cover game in non-TOPMOST Z-order → show
+    // - Alt-tab to browser: browser is non-TOPMOST, placed above game → hide
+    // - Game never minimizes in borderless fullscreen → IsIconic useless, Z-order works
+    {
+      bool coveredByApp = false;
+      // Walk Z-order from top, looking for a visible non-TOPMOST window above the game
+      HWND w = GetTopWindow(NULL);
+      while (w && w != g_gameHwnd) {
+        if (w != hwnd && IsWindowVisible(w)) {
+          LONG exStyle = GetWindowLongA(w, GWL_EXSTYLE);
+          bool isOverlay = (exStyle & WS_EX_TOPMOST) || (exStyle & WS_EX_TOOLWINDOW);
+          if (!isOverlay) {
+            // A regular visible window is above the game — user alt-tabbed
+            RECT wr;
+            GetWindowRect(w, &wr);
+            int wArea = (wr.right - wr.left) * (wr.bottom - wr.top);
+            if (wArea > 50000) { // ignore tiny windows (notifications, tooltips)
+              coveredByApp = true;
+              break;
+            }
+          }
+        }
+        w = GetNextWindow(w, GW_HWNDNEXT);
+      }
+      if (coveredByApp) {
+        if (IsWindowVisible(hwnd)) ShowWindow(hwnd, SW_HIDE);
+        return 0;
+      } else if (!IsWindowVisible(hwnd)) {
+        ShowWindow(hwnd, SW_SHOWNA);
+        g_needRepaint = true;
+      }
     }
 
     // Sync overlay position with game window
@@ -378,8 +398,6 @@ LRESULT CALLBACK OverlayWndProc(HWND hwnd, UINT msg, WPARAM wParam,
         firstIconCenterX + iconSpacing * 30 + halfIcon; // up to 30 icons
     float buffRegionTop = iconCenterY - halfIcon - 5;
     float buffRegionBottom = iconCenterY + halfIcon + 5;
-
-    // F9 debug: log cursor position for calibration (removed for release)
 
     bool newHover = false;
     int hoveredVisIdx = -1;
@@ -433,8 +451,6 @@ LRESULT CALLBACK OverlayWndProc(HWND hwnd, UINT msg, WPARAM wParam,
       int bIdx = visibleMap[hoveredVisIdx];
       if (bIdx >= 0 && bIdx < g_buffCount) {
         ActiveBuff ab = g_buffs[bIdx]; // Copy for aggregation
-        
-
 
         // Count how many independent instances of this buff exist in memory
         int matchingInstances = 0;
@@ -913,7 +929,7 @@ LRESULT CALLBACK OverlayWndProc(HWND hwnd, UINT msg, WPARAM wParam,
         g_needRepaint = true;
       }
     }
-    // Render via UpdateLayeredWindow when content changed
+    // Render via direct BitBlt when content changed
     if (g_needRepaint) {
       g_needRepaint = false;
       RenderOverlay(hwnd);
@@ -1226,14 +1242,26 @@ void hkLateTick(void *self, float dt, void *mi) {
       }
     }
   }
-
-  // F9BuffDump removed for release
 }
 
 // ============================================================================
 // Overlay Thread - completely separate from game thread
 // ============================================================================
 DWORD WINAPI OverlayThread(LPVOID) {
+  // Set per-thread DPI awareness so we get real pixel coordinates
+  // (without this, coordinates are virtualized on 125%/150%/200% displays)
+  typedef DPI_AWARENESS_CONTEXT (WINAPI *tSetThreadDpiAwarenessContext)(DPI_AWARENESS_CONTEXT);
+  HMODULE hUser32 = GetModuleHandleW(L"user32.dll");
+  if (hUser32) {
+    auto pSetDpi = (tSetThreadDpiAwarenessContext)GetProcAddress(hUser32, "SetThreadDpiAwarenessContext");
+    if (pSetDpi) {
+      pSetDpi(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
+      Log("[OK] DPI awareness set to Per-Monitor V2");
+    } else {
+      Log("[WARN] SetThreadDpiAwarenessContext not available (old Windows?)");
+    }
+  }
+
   // Wait for game window
   while (g_running && !g_gameHwnd) {
     g_gameHwnd = FindWindowA("UnityWndClass", NULL);
@@ -1258,14 +1286,64 @@ DWORD WINAPI OverlayThread(LPVOID) {
       WS_EX_LAYERED | WS_EX_TRANSPARENT | WS_EX_TOPMOST | WS_EX_NOACTIVATE | WS_EX_TOOLWINDOW,
       wc.lpszClassName, "", WS_POPUP | WS_VISIBLE, pt.x, pt.y, clientRect.right,
       clientRect.bottom, NULL, NULL, wc.hInstance, NULL);
-  // No SetLayeredWindowAttributes — UpdateLayeredWindow with ULW_COLORKEY manages transparency
+  SetLayeredWindowAttributes(g_overlayHwnd, RGB(0, 0, 0), 0, LWA_COLORKEY);
 
   Log("[OK] Overlay window created: %p", g_overlayHwnd);
 
-  // Initial render so the window isn't invisible until first timer tick
+  // Comprehensive diagnostics for invisible-HUD debugging
+  {
+    // Game window info
+    LONG style = GetWindowLongA(g_gameHwnd, GWL_STYLE);
+    LONG exStyle = GetWindowLongA(g_gameHwnd, GWL_EXSTYLE);
+    RECT gameRect;
+    GetWindowRect(g_gameHwnd, &gameRect);
+    int screenW = GetSystemMetrics(SM_CXSCREEN);
+    int screenH = GetSystemMetrics(SM_CYSCREEN);
+    int gameW = gameRect.right - gameRect.left;
+    int gameH = gameRect.bottom - gameRect.top;
+
+    // DPI info
+    typedef UINT (WINAPI *tGetDpiForWindow)(HWND);
+    UINT gameDpi = 96, overlayDpi = 96;
+    if (hUser32) {
+      auto pGetDpi = (tGetDpiForWindow)GetProcAddress(hUser32, "GetDpiForWindow");
+      if (pGetDpi) {
+        gameDpi = pGetDpi(g_gameHwnd);
+        overlayDpi = pGetDpi(g_overlayHwnd);
+      }
+    }
+
+    // Overlay window info
+    RECT overlayRect;
+    GetWindowRect(g_overlayHwnd, &overlayRect);
+    int ovW = overlayRect.right - overlayRect.left;
+    int ovH = overlayRect.bottom - overlayRect.top;
+
+    // Foreground window info
+    HWND fg = GetForegroundWindow();
+    char fgClass[128] = {};
+    if (fg) GetClassNameA(fg, fgClass, sizeof(fgClass));
+
+    Log("[DIAG] Game: %dx%d at (%d,%d) style=0x%X exStyle=0x%X dpi=%u",
+        gameW, gameH, (int)gameRect.left, (int)gameRect.top,
+        (int)style, (int)exStyle, gameDpi);
+    Log("[DIAG] Overlay: %dx%d at (%d,%d) dpi=%u client=%dx%d",
+        ovW, ovH, (int)overlayRect.left, (int)overlayRect.top,
+        overlayDpi, (int)clientRect.right, (int)clientRect.bottom);
+    Log("[DIAG] Screen: %dx%d scale=%d%% fg=%p class=%s",
+        screenW, screenH, (int)(gameDpi * 100 / 96),
+        fg, fgClass[0] ? fgClass : "(null)");
+
+    if (gameDpi != overlayDpi)
+      Log("[WARN] DPI mismatch: game=%u overlay=%u — coordinates may be wrong", gameDpi, overlayDpi);
+    if (fg != g_gameHwnd)
+      Log("[INFO] Foreground window is not the game (class=%s) — this is normal with launcher overlays", fgClass);
+  }
+
+  // Initial render so the window isn't blank until first timer tick
   RenderOverlay(g_overlayHwnd);
 
-  // Timer for hit-testing + ULW render (~33ms = 30Hz polling)
+  // Timer for hit-testing + direct render (~33ms = 30Hz polling)
   SetTimer(g_overlayHwnd, 1, 33, NULL);
 
   MSG msg;

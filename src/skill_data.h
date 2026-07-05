@@ -37,7 +37,13 @@ struct SkillHudState {
   bool  dataValid;
 };
 
-static SkillHudState g_skillHud = {};
+static SkillHudState MakeEmptyHudState() {
+  SkillHudState s = {};
+  for (int i = 0; i < 4; i++) s.synchro[i].isEmpty = true;
+  return s;
+}
+
+static SkillHudState g_skillHud = MakeEmptyHudState();
 static CRITICAL_SECTION g_skillLock;
 
 // ============================================================================
@@ -137,7 +143,7 @@ static volatile bool g_sceneActive = false;  // OnShow/OnHide
 static volatile bool g_combatActive = false; // _OnBattleTeamChanged/OnRelease
 static void *g_mainCharHpBarPtr = nullptr;
 
-// CanvasGroup alpha cache (file-scope so we can invalidate on restart)
+// CanvasGroup alpha: method pointer cache (re-resolved when HpBar instance changes)
 static void *s_cgGetAlpha = nullptr;
 static bool  s_cgResolved = false;
 
@@ -147,8 +153,8 @@ static tHpBarOnShow oHpBarOnShow = nullptr;
 
 void hkHpBarOnShow(void *self, void *methodInfo) {
   oHpBarOnShow(self, methodInfo);
-  // If the HpBar object changed (restart creates new instance), invalidate cache
-  if (g_mainCharHpBarPtr != nullptr && g_mainCharHpBarPtr != self) {
+  // Always invalidate CG cache — CanvasGroup object changes when UI is recreated
+  if (g_mainCharHpBarPtr != self) {
     s_cgResolved = false;
     s_cgGetAlpha = nullptr;
   }
@@ -186,9 +192,9 @@ void hkComboPanelBattleChanged(void *self, void *methodInfo) {
   // Reset CG alpha cache so it re-resolves with new UI objects
   s_cgResolved = false;
   s_cgGetAlpha = nullptr;
-  // Clear HUD data so stale values don't persist
+  // Clear HUD data so stale values don't persist (all slots default to empty)
   EnterCriticalSection(&g_skillLock);
-  g_skillHud = {};
+  g_skillHud = MakeEmptyHudState();
   LeaveCriticalSection(&g_skillLock);
   g_combatActive = true;
 }
@@ -317,7 +323,6 @@ void hkSkillBtnPreTick(void *self, void *deltaTime, void *methodInfo) {
         }
       }
     }
-
     // Write to shared state (thread-safe)
     EnterCriticalSection(&g_skillLock);
     g_skillHud.synchro[charIdx] = synchro;
@@ -425,23 +430,21 @@ static void DrawSkillHud(HDC hdc, HWND hwnd) {
 
   // Only show HUD when scene is active
   if (!g_sceneActive) return;
-  // Check if the bottom UI is visible via CanvasGroup alpha
+  // Check CanvasGroup alpha by re-walking pointer chain every frame
+  // DO NOT cache cgObj — it gets destroyed/recreated when UI panels open/close
   if (g_mainCharHpBarPtr) {
     void *fadeCtrl = SReadPtr(g_mainCharHpBarPtr, 0x198);
     if (fadeCtrl) {
-      if (!s_cgResolved) {
-        s_cgResolved = true;
-        void *cgObj = SReadPtr(fadeCtrl, 0x20);
-        if (cgObj) {
+      void *cgObj = SReadPtr(fadeCtrl, 0x20);
+      if (cgObj) {
+        if (!s_cgResolved) {
+          s_cgResolved = true;
           void *k = il2cpp_object_get_class(cgObj);
           if (k) s_cgGetAlpha = FindMethod(k, "get_alpha", 0);
         }
-      }
-      if (s_cgGetAlpha) {
-        void *cgObj = SReadPtr(fadeCtrl, 0x20);
-        if (cgObj) {
+        if (s_cgGetAlpha) {
           float alpha = SInvokeFloat(s_cgGetAlpha, cgObj);
-          if (alpha < 0.1f) return; // UI faded out
+          if (alpha < 0.1f) return;
         }
       }
     }
