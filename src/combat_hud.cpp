@@ -264,22 +264,53 @@ static void DrawTooltip(HDC hdc) {
   SelectObject(hdc, (HFONT)GetStockObject(DEFAULT_GUI_FONT));
 }
 
+// Repaint flag — set by tooltip/skill change detection, consumed by ULW render
+static bool g_needRepaint = true;
+
+// Render overlay content via UpdateLayeredWindow (bypasses DWM dirty notifications)
+static void RenderOverlay(HWND hwnd) {
+  RECT cr;
+  GetClientRect(hwnd, &cr);
+  int w = cr.right, h = cr.bottom;
+  if (w <= 0 || h <= 0) return;
+
+  HDC screenDC = GetDC(NULL);
+  HDC memDC = CreateCompatibleDC(screenDC);
+  HBITMAP memBmp = CreateCompatibleBitmap(screenDC, w, h);
+  HBITMAP oldBmp = (HBITMAP)SelectObject(memDC, memBmp);
+
+  // Clear to black (= transparent via ULW_COLORKEY)
+  HBRUSH clearBrush = CreateSolidBrush(RGB(0, 0, 0));
+  FillRect(memDC, &cr, clearBrush);
+  DeleteObject(clearBrush);
+
+  // Draw all content to memory DC
+  DrawTooltip(memDC);
+  DrawSkillHud(memDC, hwnd);
+
+  // Submit completed frame — ULW_COLORKEY makes black pixels transparent
+  // This does NOT trigger DWM dirty notifications like InvalidateRect does
+  POINT ptSrc = {0, 0};
+  SIZE sz = {w, h};
+  POINT ptWin;
+  {
+    RECT wr; GetWindowRect(hwnd, &wr);
+    ptWin = {wr.left, wr.top};
+  }
+  UpdateLayeredWindow(hwnd, screenDC, &ptWin, &sz, memDC, &ptSrc,
+                      RGB(0, 0, 0), NULL, ULW_COLORKEY);
+
+  SelectObject(memDC, oldBmp);
+  DeleteObject(memBmp);
+  DeleteDC(memDC);
+  ReleaseDC(NULL, screenDC);
+}
+
 LRESULT CALLBACK OverlayWndProc(HWND hwnd, UINT msg, WPARAM wParam,
                                 LPARAM lParam) {
   if (msg == WM_PAINT) {
-    PAINTSTRUCT ps;
-    HDC hdc = BeginPaint(hwnd, &ps);
-    // Clear entire window to black (= transparent via LWA_COLORKEY)
-    RECT cr;
-    GetClientRect(hwnd, &cr);
-    HBRUSH clearBrush = CreateSolidBrush(RGB(0, 0, 0));
-    FillRect(hdc, &cr, clearBrush);
-    DeleteObject(clearBrush);
-    // Draw tooltip on top (non-black pixels will be visible)
-    DrawTooltip(hdc);
-    // Draw skill HUD (synchro CD + ultimate charge)
-    DrawSkillHud(hdc, hwnd);
-    EndPaint(hwnd, &ps);
+    // ULW manages rendering — just validate to suppress further WM_PAINT
+    ValidateRect(hwnd, NULL);
     return 0;
   }
   if (msg == WM_ERASEBKGND)
@@ -859,7 +890,7 @@ LRESULT CALLBACK OverlayWndProc(HWND hwnd, UINT msg, WPARAM wParam,
         s_lastTooltipX = g_tooltipX;
         s_lastTooltipY = g_tooltipY;
       }
-      InvalidateRect(hwnd, NULL, TRUE);
+      g_needRepaint = true;
     } else if (newHover) {
       if (strcmp(s_lastTooltipText, g_tooltipText) != 0 || 
           s_lastTooltipX != g_tooltipX || 
@@ -867,26 +898,25 @@ LRESULT CALLBACK OverlayWndProc(HWND hwnd, UINT msg, WPARAM wParam,
         strcpy(s_lastTooltipText, g_tooltipText);
         s_lastTooltipX = g_tooltipX;
         s_lastTooltipY = g_tooltipY;
-        InvalidateRect(hwnd, NULL, TRUE);
+        g_needRepaint = true;
       }
     }
-    // Skill HUD: throttled redraw (max 10fps) to avoid DWM compositing storm
-    // Cooldown/charge displays don't need high refresh — 100ms is imperceptible
+    // Skill HUD: check for data changes
     {
-      static DWORD s_lastSkillRedraw = 0;
-      DWORD now = GetTickCount();
-      if (now - s_lastSkillRedraw >= 100) {
-        static SkillHudState s_lastSkillState = {};
-        SkillHudState curState;
-        EnterCriticalSection(&g_skillLock);
-        curState = g_skillHud;
-        LeaveCriticalSection(&g_skillLock);
-        if (memcmp(&curState, &s_lastSkillState, sizeof(curState)) != 0) {
-          s_lastSkillState = curState;
-          InvalidateRect(hwnd, NULL, TRUE);
-        }
-        s_lastSkillRedraw = now;
+      static SkillHudState s_lastSkillState = {};
+      SkillHudState curState;
+      EnterCriticalSection(&g_skillLock);
+      curState = g_skillHud;
+      LeaveCriticalSection(&g_skillLock);
+      if (memcmp(&curState, &s_lastSkillState, sizeof(curState)) != 0) {
+        s_lastSkillState = curState;
+        g_needRepaint = true;
       }
+    }
+    // Render via UpdateLayeredWindow when content changed
+    if (g_needRepaint) {
+      g_needRepaint = false;
+      RenderOverlay(hwnd);
     }
     return 0;
   }
@@ -1228,11 +1258,14 @@ DWORD WINAPI OverlayThread(LPVOID) {
       WS_EX_LAYERED | WS_EX_TRANSPARENT | WS_EX_TOPMOST | WS_EX_NOACTIVATE | WS_EX_TOOLWINDOW,
       wc.lpszClassName, "", WS_POPUP | WS_VISIBLE, pt.x, pt.y, clientRect.right,
       clientRect.bottom, NULL, NULL, wc.hInstance, NULL);
-  SetLayeredWindowAttributes(g_overlayHwnd, RGB(0, 0, 0), 0, LWA_COLORKEY);
+  // No SetLayeredWindowAttributes — UpdateLayeredWindow with ULW_COLORKEY manages transparency
 
   Log("[OK] Overlay window created: %p", g_overlayHwnd);
 
-  // Start a timer for hit-testing at ~30fps (lower rate reduces DWM compositing pressure)
+  // Initial render so the window isn't invisible until first timer tick
+  RenderOverlay(g_overlayHwnd);
+
+  // Timer for hit-testing + ULW render (~33ms = 30Hz polling)
   SetTimer(g_overlayHwnd, 1, 33, NULL);
 
   MSG msg;
