@@ -236,8 +236,12 @@ static void ResolveComboSkill(void *abilityPtr, int charIdx) {
         g_comboAbilityPtr[charIdx] = abilityPtr;
         float cdTot = g_mSkillGetCooldown ?
             SInvokeFloat(g_mSkillGetCooldown, skill) : 0.0f;
-        Log("[SkillHUD] ComboSkill found for char=%d obj=%p cdTotal=%.1f",
-            charIdx, skill, cdTot);
+        static void *s_lastLoggedSkill[4] = {};
+        if (s_lastLoggedSkill[charIdx] != skill) {
+          s_lastLoggedSkill[charIdx] = skill;
+          Log("[SkillHUD] ComboSkill found for char=%d obj=%p cdTotal=%.1f",
+              charIdx, skill, cdTot);
+        }
         return;
       }
     }

@@ -9,19 +9,24 @@
 
 extern "C" __declspec(dllexport) void DummyExport() {}
 
-static FILE *g_logFile = nullptr;
+static HANDLE g_logHandle = INVALID_HANDLE_VALUE;
 static CRITICAL_SECTION g_logLock;
 
 void Log(const char *fmt, ...) {
-  if (!g_logFile)
+  if (g_logHandle == INVALID_HANDLE_VALUE)
     return;
-  EnterCriticalSection(&g_logLock);
+  char buf[4096];
   va_list args;
   va_start(args, fmt);
-  vfprintf(g_logFile, fmt, args);
+  int len = vsnprintf(buf, sizeof(buf) - 2, fmt, args);
   va_end(args);
-  fprintf(g_logFile, "\n");
-  fflush(g_logFile);
+  if (len < 0) return;
+  if (len > (int)sizeof(buf) - 3) len = (int)sizeof(buf) - 3;
+  buf[len++] = '\r';
+  buf[len++] = '\n';
+  EnterCriticalSection(&g_logLock);
+  DWORD written;
+  WriteFile(g_logHandle, buf, (DWORD)len, &written, NULL);
   LeaveCriticalSection(&g_logLock);
 }
 
@@ -865,8 +870,24 @@ LRESULT CALLBACK OverlayWndProc(HWND hwnd, UINT msg, WPARAM wParam,
         InvalidateRect(hwnd, NULL, TRUE);
       }
     }
-    // Always invalidate for skill HUD continuous refresh
-    InvalidateRect(hwnd, NULL, TRUE);
+    // Skill HUD: throttled redraw (max 10fps) to avoid DWM compositing storm
+    // Cooldown/charge displays don't need high refresh — 100ms is imperceptible
+    {
+      static DWORD s_lastSkillRedraw = 0;
+      DWORD now = GetTickCount();
+      if (now - s_lastSkillRedraw >= 100) {
+        static SkillHudState s_lastSkillState = {};
+        SkillHudState curState;
+        EnterCriticalSection(&g_skillLock);
+        curState = g_skillHud;
+        LeaveCriticalSection(&g_skillLock);
+        if (memcmp(&curState, &s_lastSkillState, sizeof(curState)) != 0) {
+          s_lastSkillState = curState;
+          InvalidateRect(hwnd, NULL, TRUE);
+        }
+        s_lastSkillRedraw = now;
+      }
+    }
     return 0;
   }
   return DefWindowProc(hwnd, msg, wParam, lParam);
@@ -1211,8 +1232,8 @@ DWORD WINAPI OverlayThread(LPVOID) {
 
   Log("[OK] Overlay window created: %p", g_overlayHwnd);
 
-  // Start a timer for hit-testing at ~60fps
-  SetTimer(g_overlayHwnd, 1, 16, NULL);
+  // Start a timer for hit-testing at ~30fps (lower rate reduces DWM compositing pressure)
+  SetTimer(g_overlayHwnd, 1, 33, NULL);
 
   MSG msg;
   while (GetMessage(&msg, NULL, 0, 0)) {
@@ -1235,7 +1256,9 @@ DWORD WINAPI MainThread(LPVOID) {
   size_t pos = d.find_last_of("\\/");
   if (pos != std::string::npos)
     d = d.substr(0, pos + 1);
-  g_logFile = fopen((d + "plugin\\buff_sniff_log.txt").c_str(), "w");
+  std::string logPath = d + "plugin\\buff_sniff_log.txt";
+  g_logHandle = CreateFileA(logPath.c_str(), GENERIC_WRITE, FILE_SHARE_READ, NULL,
+                            CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL | FILE_FLAG_WRITE_THROUGH, NULL);
 
   Log("=== EndfieldCombatHUD Phase 2d: Lightweight Overlay ===");
   for (int i = 0; i < 120; i++) {
@@ -1243,10 +1266,21 @@ DWORD WINAPI MainThread(LPVOID) {
       break;
     Sleep(1000);
   }
-  Sleep(15000);
-  if (!Resolve()) {
-    Log("[FATAL] resolve failed");
-    return 1;
+  // Wait for IL2CPP to finish initializing exports (retry instead of fixed delay)
+  {
+    bool resolved = false;
+    for (int attempt = 0; attempt < 30; attempt++) {
+      Sleep(1000);
+      if (Resolve()) {
+        resolved = true;
+        Log("[OK] IL2CPP resolved after %d seconds", attempt + 1);
+        break;
+      }
+    }
+    if (!resolved) {
+      Log("[FATAL] IL2CPP resolve failed after 30 retries");
+      return 1;
+    }
   }
 
   void *dom = il2cpp_domain_get();
