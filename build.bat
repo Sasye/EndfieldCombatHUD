@@ -61,6 +61,7 @@ cl /nologo /utf-8 /O2 /MD /LD /EHsc /std:c++17 ^
     deps\minhook_lib\lib\libMinHook.x64.lib ^
     user32.lib ^
     gdi32.lib ^
+    /Fo"bin\\" ^
     /Fe"bin\EndfieldCombatHUD.dll" ^
     /link /DLL
 
@@ -76,6 +77,7 @@ echo.
 echo [3/4] Building d3dcompiler_47.dll (proxy loader) ...
 cl /nologo /O2 /MD /LD /EHsc /std:c++17 ^
     src\proxy_d3dcompiler.cpp ^
+    /Fo"bin\\" ^
     /Fe"bin\d3dcompiler_47.dll" ^
     /link /DLL
 
@@ -91,6 +93,7 @@ echo.
 echo [4/4] Building vulkan-1.dll (vulkan proxy loader) ...
 cl /nologo /O2 /MD /LD /EHsc /std:c++17 ^
     src\proxy_vulkan_full.cpp ^
+    /Fo"bin\\" ^
     /Fe"bin\vulkan-1.dll" ^
     /link /DLL
 
@@ -102,16 +105,10 @@ if %errorlevel% neq 0 (
 echo [OK] vulkan-1.dll built successfully
 echo.
 
-:: Clean up intermediate files
-del /q EndfieldCombatHUD.obj 2>nul
-del /q EndfieldCombatHUD.exp 2>nul
-del /q EndfieldCombatHUD.lib 2>nul
-del /q proxy_d3dcompiler.obj 2>nul
-del /q proxy_d3dcompiler.exp 2>nul
-del /q proxy_d3dcompiler.lib 2>nul
-del /q proxy_vulkan_full.obj 2>nul
-del /q proxy_vulkan_full.exp 2>nul
-del /q proxy_vulkan_full.lib 2>nul
+:: Clean up intermediate files from bin\
+del /q bin\combat_hud.obj 2>nul
+del /q bin\proxy_d3dcompiler.obj 2>nul
+del /q bin\proxy_vulkan_full.obj 2>nul
 
 echo ==========================================
 echo   Build Complete!

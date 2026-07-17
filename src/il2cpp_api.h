@@ -163,3 +163,62 @@ static void *Invoke(void *method, void *obj, void **params = nullptr) {
     return nullptr;
   }
 }
+
+// ============================================================================
+// Dynamic field offset resolution (from EIEM)
+// ============================================================================
+
+// Find a field by name, walking up the inheritance chain.
+// Returns the field offset or -1 if not found.
+static int FindFieldInHierarchy(void *klass, const char **names, int nameCount,
+                                const char **outFieldName = nullptr) {
+  if (!klass || !il2cpp_class_get_parent)
+    return -1;
+  void *cur = klass;
+  int depth = 0;
+  while (cur && depth < 10) {
+    void *it = nullptr, *f;
+    while ((f = il2cpp_class_get_fields(cur, &it))) {
+      const char *fn = il2cpp_field_get_name(f);
+      if (!fn)
+        continue;
+      for (int i = 0; i < nameCount; i++) {
+        if (strcmp(fn, names[i]) == 0) {
+          if (outFieldName)
+            *outFieldName = fn;
+          return (int)il2cpp_field_get_offset(f);
+        }
+      }
+    }
+    cur = il2cpp_class_get_parent(cur);
+    depth++;
+  }
+  return -1;
+}
+
+// Convenience: single field name lookup
+static int FindField(void *klass, const char *name) {
+  const char *names[] = {name};
+  return FindFieldInHierarchy(klass, names, 1);
+}
+
+// Dump all fields in the entire hierarchy (for diagnostics)
+static void DumpFieldsHierarchy(void *klass) {
+  if (!klass || !il2cpp_class_get_parent)
+    return;
+  void *cur = klass;
+  int depth = 0;
+  while (cur && depth < 10) {
+    const char *cn = il2cpp_class_get_name(cur);
+    Log("[DUMP]   --- %s ---", cn ? cn : "?");
+    void *it = nullptr, *f;
+    while ((f = il2cpp_class_get_fields(cur, &it))) {
+      const char *fn = il2cpp_field_get_name(f);
+      int fo = (int)il2cpp_field_get_offset(f);
+      if (fn)
+        Log("[DUMP]   [0x%X] %s", fo, fn);
+    }
+    cur = il2cpp_class_get_parent(cur);
+    depth++;
+  }
+}

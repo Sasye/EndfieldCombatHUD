@@ -1,8 +1,8 @@
 #include <winver.h>
 
 VS_VERSION_INFO VERSIONINFO
-FILEVERSION     0,1,3,0
-PRODUCTVERSION  0,1,3,0
+FILEVERSION     0,1,4,0
+PRODUCTVERSION  0,1,4,0
 FILEFLAGSMASK   VS_FFI_FILEFLAGSMASK
 FILEFLAGS       0
 FILEOS          VOS_NT_WINDOWS32
@@ -15,12 +15,12 @@ BEGIN
         BEGIN
             VALUE "CompanyName",      "EndfieldCombatHUD"
             VALUE "FileDescription",  "Endfield Combat HUD Plugin"
-            VALUE "FileVersion",      "0.1.3"
+            VALUE "FileVersion",      "0.1.4"
             VALUE "InternalName",     "EndfieldCombatHUD"
             VALUE "LegalCopyright",   "AGPL-3.0"
             VALUE "OriginalFilename", "EndfieldCombatHUD.dll"
             VALUE "ProductName",      "EndfieldCombatHUD"
-            VALUE "ProductVersion",   "0.1.3"
+            VALUE "ProductVersion",   "0.1.4"
         END
     END
     BLOCK "VarFileInfo"

@@ -81,13 +81,9 @@ static void DrawTooltip(HDC hdc) {
   }
   if (lineCount == 0) return;
 
-  // Resolution scaling: base design at 1440p
-  HWND wnd = WindowFromDC(hdc);
+  // Resolution scaling: base design at 1440p — use game window dimensions
   float scale = 1.0f;
-  if (wnd) {
-    RECT wr; GetClientRect(wnd, &wr);
-    if (wr.bottom > 0) scale = wr.bottom / 1440.0f;
-  }
+  if (g_gameH > 0) scale = (float)g_gameH / 1440.0f;
   if (scale < 0.5f) scale = 0.5f;
   if (scale > 3.0f) scale = 3.0f;
 
@@ -166,10 +162,7 @@ static void DrawTooltip(HDC hdc) {
   int tx = g_tooltipX + cursorOff;
   int ty = g_tooltipY - panelH - (int)(5 * scale);
   if (ty < 0) ty = g_tooltipY + cursorOff;
-  if (wnd) {
-    RECT sr; GetClientRect(wnd, &sr);
-    if (tx + panelW > sr.right) tx = g_tooltipX - panelW - (int)(5 * scale);
-  }
+  if (tx + panelW > g_gameW) tx = g_tooltipX - panelW - (int)(5 * scale);
 
   int px = tx, py = ty;
 
@@ -265,9 +258,57 @@ static void DrawTooltip(HDC hdc) {
 // Repaint flag — set by tooltip/skill change detection, consumed by timer render
 static bool g_needRepaint = true;
 
+// Compute the tight bounding rect of all overlay content in game-window coordinates.
+// Overlay only covers this region, dramatically reducing DWM compositing area
+// (the main cause of input/render latency at high resolutions).
+static RECT ComputeContentRect(int gW, int gH) {
+  float scale = (float)gH / 1440.0f;
+  int cx = gW / 2;
+  int cy = (int)(gH * 0.49f);
+
+  // Skill HUD bounds
+  int blockGap = (int)(150 * scale);
+  int barW = (int)(120 * scale);
+  int curveOff = (int)(15 * scale);
+  int textH = (int)(19 * scale);
+  int barH = (int)(5 * scale);
+  int slotGap = (int)(22 * scale);
+  int slotH = textH + barH + slotGap;
+  int totalH = 4 * slotH;
+  int margin = (int)(30 * scale);
+
+  int sL = cx - blockGap - barW - curveOff - margin;
+  int sR = cx + blockGap + barW + curveOff + margin;
+  int sT = cy - totalH / 2 - margin;
+  int sB = cy + totalH / 2 + margin;
+
+  // Buff icon area (bottom-left) + tooltip space
+  float iconSpacing = gH * 0.0317f;
+  float firstIconX = gW * 0.422f;
+  float iconY = gH * 0.946f;
+  float iconSz = gH * 0.025f;
+  int bL = (int)(firstIconX - iconSz);
+  int bR = (int)(firstIconX + iconSpacing * 30 + iconSz + 500 * scale); // tooltip room
+  int bT = (int)(iconY - iconSz - 10);
+  int bB = (int)(iconY + iconSz + 300 * scale); // tooltip height
+
+  // Union
+  RECT r;
+  r.left   = max(0L, (long)min(sL, bL));
+  r.right  = min((long)gW, (long)max(sR, bR));
+  r.top    = max(0L, (long)min(sT, bT));
+  r.bottom = min((long)gH, (long)max(sB, bB));
+  return r;
+}
+
 // Render overlay content directly via GetDC+BitBlt (no InvalidateRect, no WM_PAINT)
 // Transparency is handled by SetLayeredWindowAttributes(LWA_COLORKEY) set at creation.
 // This avoids both DWM dirty notifications AND ULW_COLORKEY compatibility issues.
+static HDC    s_memDC = NULL;
+static HBITMAP s_memBmp = NULL;
+static HBITMAP s_oldBmp = NULL;
+static int    s_memW = 0, s_memH = 0;
+
 static void RenderOverlay(HWND hwnd) {
   RECT cr;
   GetClientRect(hwnd, &cr);
@@ -276,25 +317,39 @@ static void RenderOverlay(HWND hwnd) {
 
   HDC winDC = GetDC(hwnd);
   if (!winDC) return;
-  HDC memDC = CreateCompatibleDC(winDC);
-  HBITMAP memBmp = CreateCompatibleBitmap(winDC, w, h);
-  HBITMAP oldBmp = (HBITMAP)SelectObject(memDC, memBmp);
 
-  // Clear to black (= transparent via LWA_COLORKEY)
-  HBRUSH clearBrush = CreateSolidBrush(RGB(0, 0, 0));
-  FillRect(memDC, &cr, clearBrush);
-  DeleteObject(clearBrush);
+  // Recreate cached bitmap only if window size changed
+  if (!s_memDC || s_memW != w || s_memH != h) {
+    if (s_memDC) {
+      SelectObject(s_memDC, s_oldBmp);
+      DeleteObject(s_memBmp);
+      DeleteDC(s_memDC);
+    }
+    s_memDC = CreateCompatibleDC(winDC);
+    s_memBmp = CreateCompatibleBitmap(winDC, w, h);
+    s_oldBmp = (HBITMAP)SelectObject(s_memDC, s_memBmp);
+    s_memW = w;
+    s_memH = h;
+  }
 
-  // Draw all content to memory DC
-  DrawTooltip(memDC);
-  DrawSkillHud(memDC, hwnd);
+  // Coordinate mapping: game-window coords → overlay-local bitmap coords
+  // DrawTooltip/DrawSkillHud use game-window coordinates unchanged;
+  // SetWindowOrgEx shifts the logical origin so (g_overlayOX, g_overlayOY)
+  // maps to device (0, 0) in the bitmap.
+  SetWindowOrgEx(s_memDC, g_overlayOX, g_overlayOY, NULL);
 
-  // Single atomic blit — no InvalidateRect, no WM_PAINT, no DWM dirty notification
-  BitBlt(winDC, 0, 0, w, h, memDC, 0, 0, SRCCOPY);
+  // Clear bitmap (in mapped coordinates)
+  RECT clearRect = {g_overlayOX, g_overlayOY, g_overlayOX + w, g_overlayOY + h};
+  FillRect(s_memDC, &clearRect, (HBRUSH)GetStockObject(BLACK_BRUSH));
 
-  SelectObject(memDC, oldBmp);
-  DeleteObject(memBmp);
-  DeleteDC(memDC);
+  // Draw all content using game-window coordinates
+  DrawTooltip(s_memDC);
+  DrawSkillHud(s_memDC, hwnd);
+
+  // Reset origin for BitBlt (device coordinates)
+  SetWindowOrgEx(s_memDC, 0, 0, NULL);
+  BitBlt(winDC, 0, 0, w, h, s_memDC, 0, 0, SRCCOPY);
+
   ReleaseDC(hwnd, winDC);
 }
 
@@ -318,12 +373,13 @@ LRESULT CALLBACK OverlayWndProc(HWND hwnd, UINT msg, WPARAM wParam,
       return 0;
     }
 
-    // Z-order based visibility: check if the game window is covered by a
-    // regular (non-overlay) window. This correctly handles:
-    // - WeGame/TXGuiFoundation: TOPMOST overlay, doesn't cover game in non-TOPMOST Z-order → show
-    // - Alt-tab to browser: browser is non-TOPMOST, placed above game → hide
-    // - Game never minimizes in borderless fullscreen → IsIconic useless, Z-order works
+    // Z-order based visibility (throttled to every ~500ms to reduce overhead)
+    // On 4K displays, the per-tick Z-order walk + full-screen bitmap ops are expensive
     {
+      static DWORD s_lastZCheckTick = 0;
+      DWORD now = GetTickCount();
+      if (now - s_lastZCheckTick > 100) {
+        s_lastZCheckTick = now;
       bool coveredByApp = false;
       // Walk Z-order from top, looking for a visible non-TOPMOST window above the game
       HWND w = GetTopWindow(NULL);
@@ -351,15 +407,39 @@ LRESULT CALLBACK OverlayWndProc(HWND hwnd, UINT msg, WPARAM wParam,
         ShowWindow(hwnd, SW_SHOWNA);
         g_needRepaint = true;
       }
+      }
     }
 
-    // Sync overlay position with game window
+    // Sync overlay to content-tight region (not fullscreen)
+    // DWM compositing cost is proportional to overlay area; at 4K a fullscreen
     RECT gr;
     GetClientRect(g_gameHwnd, &gr);
+    g_gameW = gr.right;
+    g_gameH = gr.bottom;
     POINT gpt = {0, 0};
     ClientToScreen(g_gameHwnd, &gpt);
-    SetWindowPos(hwnd, HWND_TOPMOST, gpt.x, gpt.y, gr.right, gr.bottom,
-                 SWP_NOACTIVATE);
+
+    // Full game window overlay — content-tight sizing clips tooltips
+    // drawn at cursor position. DWM compositing cost is negligible.
+    g_overlayOX = 0;
+    g_overlayOY = 0;
+    int ovW = g_gameW;
+    int ovH = g_gameH;
+    if (ovW < 100) ovW = 100;
+    if (ovH < 100) ovH = 100;
+
+    RECT curOv;
+    GetWindowRect(g_overlayHwnd, &curOv);
+    int curW = curOv.right - curOv.left;
+    int curH = curOv.bottom - curOv.top;
+    if (curOv.left != gpt.x ||
+        curOv.top  != gpt.y ||
+        curW != ovW || curH != ovH) {
+      SetWindowPos(hwnd, HWND_TOPMOST,
+                   gpt.x, gpt.y,
+                   ovW, ovH, SWP_NOACTIVATE);
+      g_needRepaint = true;
+    }
 
     // Get mouse position in game client coords
     POINT cursor;
@@ -418,22 +498,25 @@ LRESULT CALLBACK OverlayWndProc(HWND hwnd, UINT msg, WPARAM wParam,
             break;
           }
         }
-        visibleMap[visibleCount++] = foundIdx;
+        if (foundIdx >= 0)
+          visibleMap[visibleCount++] = foundIdx;
       }
     } else {
-      // Fallback: debuffs first, then buffs
+      // Fallback: only show buffs that came from display scan (source==2)
+      // Raw hook buffs (source 0/1) may include hidden weapon/internal buffs
+      // that the game never displays in its buff bar
       for (int i = 0; i < g_buffCount; i++) {
-        if (g_buffs[i].duration < 100000.0f && g_buffs[i].source == 1)
-          visibleMap[visibleCount++] = i;
-      }
-      for (int i = 0; i < g_buffCount; i++) {
-        if (g_buffs[i].duration < 100000.0f && g_buffs[i].source == 0)
+        if (g_buffs[i].source == 2)
           visibleMap[visibleCount++] = i;
       }
     }
 
+
+
     if (visibleCount > 0 && cursor.y >= (int)buffRegionTop &&
         cursor.y <= (int)buffRegionBottom) {
+
+
 
       // Check each visible icon individually by its center position
       for (int vIdx = 0; vIdx < visibleCount; vIdx++) {
@@ -464,7 +547,6 @@ LRESULT CALLBACK OverlayWndProc(HWND hwnd, UINT msg, WPARAM wParam,
         // If trueEnhanceCnt == enhanceCnt, the engine already scaled the AttributeModifierLoader
         // to reflect all stacks (e.g. character buffs). If trueEnhanceCnt < enhanceCnt, the UI
         // is visually grouping independent instances whose loaders only contain base values.
-        // Do NOT multiply blackboard values, as the engine dynamically updates them to the total.
         if (ab.trueEnhanceCnt > 0 && ab.enhanceCnt > ab.trueEnhanceCnt) {
           int multiplier = ab.enhanceCnt / ab.trueEnhanceCnt;
           for (int j = 0; j < 96; j++) {
@@ -476,6 +558,16 @@ LRESULT CALLBACK OverlayWndProc(HWND hwnd, UINT msg, WPARAM wParam,
             ab.attrs.baseMul[j] *= multiplier;
             ab.attrs.finalScl[j] *= multiplier;
             ab.attrs.baseFinalScl[j] *= multiplier;
+          }
+          // Also multiply blackboard values for independent-instance stacking.
+          // Each instance holds its own base value — the engine doesn't merge
+          // blackboard across independent instances.
+          // Skip 'duration' and 'rate' keys (those are per-instance constants).
+          for (int b = 0; b < ab.bbCount; b++) {
+            const char *k = ab.bb[b].key;
+            if (strcmp(k, "duration") == 0) continue;
+            if (strcmp(k, "rate") == 0) continue;
+            ab.bb[b].value *= multiplier;
           }
         }
 
@@ -738,7 +830,9 @@ LRESULT CALLBACK OverlayWndProc(HWND hwnd, UINT msg, WPARAM wParam,
           {"heal",            "\xe6\xb2\xbb\xe7\x96\x97\xe9\x87\x8f", false},
           // === Base stats (flat) ===
           {"atk",             "\xe6\x94\xbb\xe5\x87\xbb\xe5\x8a\x9b", false},
+          {"attack",           "\xe6\x94\xbb\xe5\x87\xbb\xe5\x8a\x9b", true},
           {"def",             "\xe9\x98\xb2\xe5\xbe\xa1\xe5\x8a\x9b", false},
+          {"defend",           "\xe9\x98\xb2\xe5\xbe\xa1\xe5\x8a\x9b", true},
           {"max_hp",          "\xe6\x9c\x80\xe5\xa4\xa7\xe7\x94\x9f\xe5\x91\xbd\xe5\x80\xbc", false},
           {"atk_up",          "\xe6\x94\xbb\xe5\x87\xbb\xe5\x8a\x9b", true},
           {"def_up",          "\xe9\x98\xb2\xe5\xbe\xa1\xe5\x8a\x9b", true},
@@ -833,6 +927,10 @@ LRESULT CALLBACK OverlayWndProc(HWND hwnd, UINT msg, WPARAM wParam,
           {"infliction_enhance","\xe6\xba\x90\xe7\x9f\xb3\xe6\x8a\x80\xe8\x89\xba\xe5\xbc\xba\xe5\xba\xa6", false},
           // === Combo zone ===
           {"combo_dmg",       "\xe8\xbf\x9e\xe5\x87\xbb\xe5\xa2\x9e\xe4\xbc\xa4", true},
+          // === Normal/Crit (角色大招层数) ===
+          {"normal_dmg_up",   "\xe6\x99\xae\xe6\x94\xbb\xe5\xa2\x9e\xe4\xbc\xa4", true},
+          {"crit_rate_up",    "\xe6\x9a\xb4\xe5\x87\xbb\xe7\x8e\x87\xe6\x8f\x90\xe5\x8d\x87", true},
+          {"crit_rate_up_dynamic", "\xe6\x9a\xb4\xe5\x87\xbb\xe7\x8e\x87(\xe5\x8a\xa8\xe6\x80\x81)", true},
         };
         for (int b = 0; b < ab.bbCount; b++) {
           const char *k = ab.bb[b].key;
@@ -859,7 +957,7 @@ LRESULT CALLBACK OverlayWndProc(HWND hwnd, UINT msg, WPARAM wParam,
         }
       }
 
-      // If tooltip has no effect info, dump blackboard to log for diagnostics
+      // If tooltip has no effect info, show raw blackboard entries as fallback
       {
         bool hasEffect = false;
         int lineCount = 0;
@@ -868,8 +966,21 @@ LRESULT CALLBACK OverlayWndProc(HWND hwnd, UINT msg, WPARAM wParam,
         if (lineCount > 3) hasEffect = true;
         if (!hasEffect) {
           Log("[NO_EFFECT] buff=%s icon=%s bbCount=%d", ab.id, ab.iconName, ab.bbCount);
-          for (int b = 0; b < ab.bbCount; b++)
+          // Show raw bb entries in tooltip as fallback
+          for (int b = 0; b < ab.bbCount; b++) {
+            const char *k = ab.bb[b].key;
+            double v = ab.bb[b].value;
+            if (strcmp(k, "duration") == 0 || strcmp(k, "rate") == 0) continue;
+            if (v == 0.0) continue;
+            char buf[200];
+            // Auto-detect percentage: values between -1 and 1 (exclusive) are likely percentages
+            if (v > -1.0 && v < 1.0 && v != 0.0)
+              snprintf(buf, sizeof(buf), " %s: %+.1f%%\n", k, v * 100.0);
+            else
+              snprintf(buf, sizeof(buf), " %s: %.1f\n", k, v);
+            tooltip_cat(buf);
             Log("  bb[%d] key='%s' value=%.6f", b, ab.bb[b].key, ab.bb[b].value);
+          }
           // Also log non-zero attributes
           for (int j = 0; j < 94; j++) {
             if (ab.attrs.add[j] != 0) Log("  attr add[%d]=%f", j, ab.attrs.add[j]);
@@ -929,6 +1040,21 @@ LRESULT CALLBACK OverlayWndProc(HWND hwnd, UINT msg, WPARAM wParam,
         g_needRepaint = true;
       }
     }
+    // Track visibility state changes — force repaint when HUD should hide/show
+    {
+      // Consume hook-triggered visibility change
+      if (g_visibilityChanged) {
+        g_visibilityChanged = false;
+        g_needRepaint = true;
+      }
+      // Also detect gradual alpha changes (fade animations)
+      static bool s_lastVisible = true;
+      bool visible = g_sceneActive && (g_cgAlpha >= 0.1f);
+      if (visible != s_lastVisible) {
+        s_lastVisible = visible;
+        g_needRepaint = true;
+      }
+    }
     // Render via direct BitBlt when content changed
     if (g_needRepaint) {
       g_needRepaint = false;
@@ -944,13 +1070,45 @@ LRESULT CALLBACK OverlayWndProc(HWND hwnd, UINT msg, WPARAM wParam,
 // ============================================================================
 typedef void (*tProgressBar)(void *, void *, void *, void *, void *);
 static tProgressBar oProgressBar = nullptr;
+static void *g_activeHpBar = nullptr; // The MainCharHpBar of the currently active (controlled) character
 void hkProgressBar(void *self, void *p1, void *p2, void *p3, void *mi) {
+  // Only process buffs from the active character's HpBar
+  // When g_activeHpBar is null (before first LateTick), skip all —
+  // display scan fallback will read visible buffs directly from cells
+  if (!g_activeHpBar || self != g_activeHpBar) {
+    oProgressBar(self, p1, p2, p3, mi);
+    return;
+  }
   uintptr_t isAdd = (uintptr_t)p2;
   ActiveBuff ab = {};
   ReadBuffData(p1, &ab);
+
+
+
   if (isAdd && ab.buffObj) {
     EnterCriticalSection(&g_buffLock);
-    if (g_buffCount < 64) {
+    // Merge same-id entries: ProgressBar fires multiple times for the same buff
+    // type (e.g. each rest interaction creates a new instance).
+    // Replace the old entry to prevent non-stacking buffs from accumulating.
+    bool merged = false;
+    for (int i = 0; i < g_buffCount; i++) {
+      if (g_buffs[i].instUid == ab.instUid) {
+        // Exact same instance — update in place
+        ab.source = g_buffs[i].source;
+        g_buffs[i] = ab;
+        merged = true;
+        break;
+      } else if (strcmp(g_buffs[i].id, ab.id) == 0 && strcmp(g_buffs[i].iconName, ab.iconName) == 0) {
+        // Same buff type via ProgressBar — replace old instance
+        g_buffs[i].buffObj = ab.buffObj;
+        g_buffs[i].instUid = ab.instUid;
+        g_buffs[i].duration = ab.duration;
+        g_buffs[i].lifeTime = ab.lifeTime;
+        merged = true;
+        break;
+      }
+    }
+    if (!merged && g_buffCount < 64) {
       ab.source = 0; // ProgressBar = buff
       g_buffs[g_buffCount++] = ab;
     }
@@ -973,15 +1131,31 @@ void hkProgressBar(void *self, void *p1, void *p2, void *p3, void *mi) {
 typedef void (*tBuffIconChange)(void *, void *, void *, void *, void *);
 static tBuffIconChange oBuffIconChange = nullptr;
 void hkBuffIconChange(void *self, void *p1, void *p2, void *p3, void *mi) {
+  // Only process buffs from the active character's HpBar
+  if (!g_activeHpBar || self != g_activeHpBar) {
+    oBuffIconChange(self, p1, p2, p3, mi);
+    return;
+  }
   uintptr_t isAdd = (uintptr_t)p2;
   ActiveBuff ab = {};
   ReadBuffData(p1, &ab);
+
+
+
   if (isAdd && ab.buffObj) {
-    // Check for duplicate (same buff might go through both paths)
     EnterCriticalSection(&g_buffLock);
+    // Check for duplicate instUid only (old proven logic)
     bool found = false;
     for (int i = 0; i < g_buffCount; i++) {
       if (g_buffs[i].instUid == ab.instUid) {
+        found = true;
+        break;
+      }
+      // If same buff type already tracked via ProgressBar, skip to avoid
+      // duplicate count. Ether buffs fire through BOTH ProgressBar and
+      // BuffIconChange. Equipsuit only fires through BuffIconChange.
+      if (g_buffs[i].source == 0 && strcmp(g_buffs[i].id, ab.id) == 0
+          && ab.iconName[0] && strcmp(g_buffs[i].iconName, ab.iconName) == 0) {
         found = true;
         break;
       }
@@ -1006,223 +1180,379 @@ void hkBuffIconChange(void *self, void *p1, void *p2, void *p3, void *mi) {
 
 typedef void (*tEnhance)(void *, void *, void *);
 static tEnhance oEnhance = nullptr;
-void hkEnhance(void *self, void *p1, void *mi) {
+static tEnhance oGpuiEnhance = nullptr;
+
+void hkEnhanceCommon(void *p1) {
   ActiveBuff ab = {};
   ReadBuffData(p1, &ab);
+
   EnterCriticalSection(&g_buffLock);
   for (int i = 0; i < g_buffCount; i++) {
     if (g_buffs[i].instUid == ab.instUid) {
       g_buffs[i].enhanceCnt = ab.enhanceCnt;
-      g_buffs[i].trueEnhanceCnt = ab.enhanceCnt; // Keep engine-side count in sync
+      g_buffs[i].trueEnhanceCnt = ab.enhanceCnt;
       break;
+    }
+    // Also match by id — display scan may have swapped the tracked instUid
+    if (strcmp(g_buffs[i].id, ab.id) == 0) {
+      g_buffs[i].enhanceCnt = ab.enhanceCnt;
+      g_buffs[i].trueEnhanceCnt = ab.enhanceCnt;
+      // Don't break — update all entries with this id
     }
   }
   LeaveCriticalSection(&g_buffLock);
-  oEnhance(self, p1, mi);
 }
 
-// Hook for _ClearMainChar - clears all buffs when entering dungeon/switching
-// char
+void hkEnhance(void *self, void *p1, void *mi) {
+  hkEnhanceCommon(p1);
+  oEnhance(self, p1, mi);
+}
+void hkGpuiEnhance(void *self, void *p1, void *mi) {
+  hkEnhanceCommon(p1);
+  oGpuiEnhance(self, p1, mi);
+}
+
+// Hook GPUIBuffNode stack operations (passthrough — stack counts read from m_stackBuffsDict)
+typedef void (*tAddStack)(void *, void *, bool, void *, void *, void *);
+static tAddStack oAddStack = nullptr;
+void hkAddStack(void *self, void *p1, bool playAnim, void *buffData, void *group, void *mi) {
+  oAddStack(self, p1, playAnim, buffData, group, mi);
+}
+typedef void (*tRemoveStack)(void *, void *, int, void *, void *, void *);
+static tRemoveStack oRemoveStack = nullptr;
+void hkRemoveStack(void *self, void *p1, int finishReason, void *buffData, void *group, void *mi) {
+  oRemoveStack(self, p1, finishReason, buffData, group, mi);
+}
+
+// Hook for _ClearMainChar - clears all buffs when entering dungeon/switching char
 typedef void (*tClearMainChar)(void *, void *);
 static tClearMainChar oClearMainChar = nullptr;
 void hkClearMainChar(void *self, void *mi) {
   EnterCriticalSection(&g_buffLock);
   g_buffCount = 0;
+  g_displayCount = 0;
   LeaveCriticalSection(&g_buffLock);
-  Log("[CLEAR] All buffs cleared");
+  // The HpBar being cleared IS the new active character's HpBar
+  g_activeHpBar = self;
+  Log("[CLEAR] All buffs cleared, activeHpBar=%p", self);
   oClearMainChar(self, mi);
 }
 
 typedef void (*tLateTick)(void *, float, void *);
 static tLateTick oLateTick = nullptr;
+
 void hkLateTick(void *self, float dt, void *mi) {
   oLateTick(self, dt, mi);
 
-  // Every ~60 frames (~1 sec), validate buff lifetimes + read display order
-  static int s_frameCounter = 0;
-  if (++s_frameCounter >= 60) {
-    s_frameCounter = 0;
-    EnterCriticalSection(&g_buffLock);
-    // Remove expired buffs + refresh lifeTime + refresh attrs for tooltip
-    for (int i = g_buffCount - 1; i >= 0; i--) {
-      if (g_buffs[i].buffObj && g_getLifeTime) {
-        float life = UnboxFloat(Invoke(g_getLifeTime, g_buffs[i].buffObj));
-        g_buffs[i].lifeTime = life; // Save for tooltip display
-        if (g_buffs[i].duration < 100000.0f && life <= 0.0f) {
-          g_buffs[i] = g_buffs[--g_buffCount];
-          continue;
+  // Track which MainCharHpBar is active (the one LateTick is called on)
+  g_activeHpBar = self;
+
+  // Read CanvasGroup alpha on game thread (safe) — overlay thread reads g_cgAlpha
+  if (g_offHpBar_fadeCtrl >= 0) {
+    void *fadeCtrl = SReadPtr(self, g_offHpBar_fadeCtrl);
+    if (fadeCtrl) {
+      int cgOff = (g_offFade_cg >= 0) ? g_offFade_cg : 0x20;
+      void *cgObj = SReadPtr(fadeCtrl, cgOff);
+      if (cgObj) {
+        if (!s_cgResolved) {
+          s_cgResolved = true;
+          void *k = il2cpp_object_get_class(cgObj);
+          if (k) s_cgGetAlpha = FindMethod(k, "get_alpha", 0);
+        }
+        if (s_cgGetAlpha) {
+          g_cgAlpha = SDirectFloat(s_cgGetAlpha, cgObj);
         }
       }
-      // Re-read enhanceCnt from the engine to keep trueEnhanceCnt fresh
-      // (it may change after the initial hook, e.g. character buffs enhance over time)
-      if (g_buffs[i].buffObj && g_getEnhanceCnt) {
-        __try {
-          void *boxedCnt = Invoke(g_getEnhanceCnt, g_buffs[i].buffObj);
-          if (boxedCnt) {
-            g_buffs[i].trueEnhanceCnt = *(int *)((char *)boxedCnt + 16);
+    }
+  }
+
+  // Wall-clock throttle: every ~1000ms (not frame-based, since at 200fps
+  // a 60-frame counter fires every 300ms — 3x too often)
+  static DWORD s_lastTickMs = 0;
+  DWORD now = GetTickCount();
+  if (now - s_lastTickMs < 1000) return;
+  s_lastTickMs = now;
+
+
+  EnterCriticalSection(&g_buffLock);
+  // Remove expired buffs + refresh lifeTime + refresh attrs for tooltip
+  // NOTE: Do NOT check m_isFinished — the game recycles buff objects to pools
+  // and sets m_isFinished even when the buff effect persists with a new instance.
+  for (int i = g_buffCount - 1; i >= 0; i--) {
+    // Refresh lifeTime (validates pointer via SEH)
+    if (g_buffs[i].buffObj && g_getLifeTime) {
+      __try {
+        void *boxedLife = Invoke(g_getLifeTime, g_buffs[i].buffObj);
+        if (boxedLife) {
+          float life = *(float *)((char *)boxedLife + 0x10);
+          g_buffs[i].lifeTime = life;
+          if (g_buffs[i].duration < 100000.0f && life <= 0.0f) {
+            g_buffs[i] = g_buffs[--g_buffCount];
+            continue;
           }
-        } __except(1) {}
-      }
-      // Re-read attributes from loader (may not be filled at hook time)
-      if (g_buffs[i].buffObj && g_loaderOffset > 0) {
-        __try {
-          void *loader = *(void **)((char *)g_buffs[i].buffObj + g_loaderOffset);
-          if (loader) {
-            auto readArr = [](void *ldr, int off, float *dst, int max) {
-              void *arr = *(void **)((char *)ldr + off);
-              if (!arr) return;
-              int32_t len = *(int32_t *)((char *)arr + 0x18);
-              if (len <= 0 || len > max) return;
-              double *data = (double *)((char *)arr + 0x20);
-              for (int j = 0; j < len && j < max; j++)
-                dst[j] = (float)data[j];
-            };
-            readArr(loader, 0x18, g_buffs[i].attrs.add, 96);
-            readArr(loader, 0x38, g_buffs[i].attrs.baseAdd, 96);
-            readArr(loader, 0x20, g_buffs[i].attrs.finalAdd, 96);
-            readArr(loader, 0x40, g_buffs[i].attrs.baseFinalAdd, 96);
-            readArr(loader, 0x10, g_buffs[i].attrs.mul, 96);
-            readArr(loader, 0x30, g_buffs[i].attrs.baseMul, 96);
-            readArr(loader, 0x28, g_buffs[i].attrs.finalScl, 96);
-            readArr(loader, 0x48, g_buffs[i].attrs.baseFinalScl, 96);
-          }
-        } __except(1) {}
+        }
+      } __except(1) {
+        // Object pointer invalid (GC'd/recycled) — null it out but KEEP the buff.
+        // Cached id/duration/lifeTime/attrs are still valid.
+        // Buff will only be removed by explicit isAdd=false callback.
+        g_buffs[i].buffObj = nullptr;
       }
     }
+    // Re-read attributes from loader (pure memory read, no invoke)
+    if (g_buffs[i].buffObj && g_loaderOffset > 0) {
+      __try {
+        void *loader = *(void **)((char *)g_buffs[i].buffObj + g_loaderOffset);
+        if (loader) {
+          auto readArr = [](void *ldr, int off, float *dst, int max) {
+            void *arr = *(void **)((char *)ldr + off);
+            if (!arr) return;
+            int32_t len = *(int32_t *)((char *)arr + 0x18);
+            if (len <= 0 || len > max) return;
+            double *data = (double *)((char *)arr + 0x20);
+            for (int j = 0; j < len && j < max; j++)
+              dst[j] = (float)data[j];
+          };
+          readArr(loader, 0x18, g_buffs[i].attrs.add, 96);
+          readArr(loader, 0x38, g_buffs[i].attrs.baseAdd, 96);
+          readArr(loader, 0x20, g_buffs[i].attrs.finalAdd, 96);
+          readArr(loader, 0x40, g_buffs[i].attrs.baseFinalAdd, 96);
+          readArr(loader, 0x10, g_buffs[i].attrs.mul, 96);
+          readArr(loader, 0x30, g_buffs[i].attrs.baseMul, 96);
+          readArr(loader, 0x28, g_buffs[i].attrs.finalScl, 96);
+          readArr(loader, 0x48, g_buffs[i].attrs.baseFinalScl, 96);
+        }
+      } __except(1) {}
+    }
+  }
 
-    // Read display order from UIBuffNode.m_orderedBuffCellList
-    if (g_orderedListOffset > 0 && g_getBuffInstanceUid) {
-      void *buffNode = *(void **)((char *)self + 0xD0);
-      if (buffNode) {
-        __try {
-          void *orderedList =
-              *(void **)((char *)buffNode + g_orderedListOffset);
-          if (orderedList) {
-            // C# List<T>: _items at +0x10, _size at +0x18
-            void *items = *(void **)((char *)orderedList + 0x10);
-            int size = *(int *)((char *)orderedList + 0x18);
-            if (items && size >= 0 && size <= 64) {
-              int newDisplayCount = 0;
-              // Array elements start at offset 0x20 in Il2Cpp array, each is a pointer
-              void **elements = (void **)((char *)items + 0x20);
-              for (int ci = 0; ci < size; ci++) {
-                void *cell = elements[ci];
-                if (!cell) continue;
-                // Get buffInstanceUid from cell
-                void *boxedUid = Invoke(g_getBuffInstanceUid, cell);
-                if (!boxedUid) continue;
-                uint32_t cellUid = *(uint32_t *)((char *)boxedUid + 16);
-                g_displayUids[newDisplayCount++] = cellUid;
-                
-                // Extract stack count from UIBuffCell._buffStackCountText (offset 0x30)
-                int uiStackCount = 1;
-                static bool s_stackDbgLogged = false;
-                __try {
-                  void *textComp = *(void **)((char *)cell + 0x30);
-                  if (!s_stackDbgLogged)
-                    Log("[STACK] cell=%p textComp(0x30)=%p", cell, textComp);
-                  if (textComp) {
-                    void *klass = il2cpp_object_get_class(textComp);
-                    if (klass) {
-                      const char *className = il2cpp_class_get_name(klass);
-                      const char *classNs = il2cpp_class_get_namespace ? il2cpp_class_get_namespace(klass) : "";
-                      if (!s_stackDbgLogged)
-                        Log("[STACK] textComp class: %s.%s", classNs ? classNs : "", className ? className : "?");
-                      // Try get_text on this class and parents
-                      void *curr = klass;
-                      void *getText = nullptr;
-                      while (curr && !getText) {
-                        getText = FindMethod(curr, "get_text", 0);
-                        if (!getText) {
-                          if (!s_stackDbgLogged) {
-                            const char *cn = il2cpp_class_get_name(curr);
-                            Log("[STACK]   no get_text in %s", cn ? cn : "?");
-                          }
-                          curr = il2cpp_class_get_parent(curr);
-                        }
-                      }
-                      if (!s_stackDbgLogged)
-                        Log("[STACK] getText method: %p", getText);
-                      if (getText) {
-                        void *sysStr = Invoke(getText, textComp);
-                        if (!s_stackDbgLogged)
-                          Log("[STACK] sysStr: %p", sysStr);
-                        if (sysStr) {
-                          char textBuf[32];
-                          int len = ReadStr(sysStr, textBuf, sizeof(textBuf));
-                          if (!s_stackDbgLogged)
-                            Log("[STACK] text='%s' len=%d", textBuf, len);
-                          if (len > 0) {
-                            int s = atoi(textBuf);
-                            if (s > 0) uiStackCount = s;
-                          }
+  // Read display order from buff node's m_orderedBuffCellList
+  // Try GPUIBuffNode first (game update switched to GPUI), then UIBuffNode fallback
+  if (g_getBuffInstanceUid) {
+    void *buffNode = nullptr;
+    int listOffset = 0;
+
+    // GPUIBuffNode at self+0xD8, its m_orderedBuffCellList at offset 0xB0
+    __try {
+      void *gpui = *(void **)((char *)self + 0xD8);
+
+      if (gpui) {
+        void *ol = *(void **)((char *)gpui + 0xB0);
+        if (ol) {
+          int sz = *(int *)((char *)ol + 0x18);
+          if (sz > 0) {
+            buffNode = gpui;
+            listOffset = 0xB0;
+          }
+        }
+      }
+    } __except(1) {}
+
+    // Fallback: UIBuffNode at self+0xD0, its m_orderedBuffCellList at g_orderedListOffset
+    if (!buffNode && g_orderedListOffset > 0) {
+      __try {
+        void *uibn = *(void **)((char *)self + 0xD0);
+        if (uibn) {
+          void *ol = *(void **)((char *)uibn + g_orderedListOffset);
+          if (ol) {
+            int sz = *(int *)((char *)ol + 0x18);
+            if (sz > 0) {
+              buffNode = uibn;
+              listOffset = (int)g_orderedListOffset;
+            }
+          }
+        }
+      } __except(1) {}
+    }
+
+    if (buffNode) {
+      __try {
+        void *orderedList = *(void **)((char *)buffNode + listOffset);
+        if (orderedList) {
+          void *items = *(void **)((char *)orderedList + 0x10);
+          int size = *(int *)((char *)orderedList + 0x18);
+          if (items && size >= 0 && size <= 64) {
+            int newDisplayCount = 0;
+            // Temporary array to rebuild g_buffs from display
+            ActiveBuff newBuffs[64];
+            int newBuffCount = 0;
+
+            // Read stack counts from GPUIBuffNode.m_stackBuffsDict (0xA8)
+            // DynamicFastLookupCollection -> m_list (+0x18) -> List<ValueTuple<String, List<ObjectPtr<Buff>>>>
+            struct StackEntry { char id[128]; int count; };
+            StackEntry stackCounts[32];
+            int stackCountN = 0;
+            __try {
+              void *stackDict = *(void **)((char *)buffNode + 0xA8);
+              if (stackDict) {
+                void *mList = *(void **)((char *)stackDict + 0x18);
+                if (mList) {
+                  int listSize = *(int *)((char *)mList + 0x18);
+                  void *listItems = *(void **)((char *)mList + 0x10);
+                  if (listItems && listSize > 0 && listSize <= 32) {
+                    // Each ValueTuple<String, List<>> is 16 bytes (2 refs)
+                    // Array starts at listItems + 0x20 (array header: 0x10 klass + 0x08 monitor + 0x08 length)
+                    // Actually: managed array: +0x10 = klass, +0x18 = length, +0x20 = data
+                    char *base = (char *)listItems + 0x20;
+                    for (int si = 0; si < listSize && stackCountN < 32; si++) {
+                      // ValueTuple<String, List>: 2 object references = 16 bytes each
+                      void *keyStr = *(void **)(base + si * 16);
+                      void *valList = *(void **)(base + si * 16 + 8);
+                      if (keyStr && valList) {
+                        char idBuf[128] = {};
+                        ReadStr(keyStr, idBuf, sizeof(idBuf));
+                        int count = *(int *)((char *)valList + 0x18); // List._size
+                        if (idBuf[0] && count > 0) {
+                          strncpy(stackCounts[stackCountN].id, idBuf, 127);
+                          stackCounts[stackCountN].count = count;
+
+                          stackCountN++;
                         }
                       }
                     }
                   }
-                  s_stackDbgLogged = true;
-                } __except(1) {
-                  if (!s_stackDbgLogged)
-                    Log("[STACK] EXCEPTION reading stack text");
-                  s_stackDbgLogged = true;
                 }
+              }
+            } __except(1) {}
 
-                // Fallback: if the buff isn't in our array (e.g. bypassed normal events)
-                // Extract it directly from UIBuffCell.m_buffPtr (offset 0x58)
-                bool found = false;
+            void **elements = (void **)((char *)items + 0x20);
+            // Resolve get_buffInstanceUid dynamically from first cell's class
+            static void *s_gpuiGetUid = nullptr;
+            static bool s_gpuiGetUidResolved = false;
+            static int s_cellBuffPtrOffset = -2; // -2 = not resolved
+
+            for (int ci = 0; ci < size; ci++) {
+              void *cell = elements[ci];
+              if (!cell) continue;
+
+              // Resolve method from actual cell class (handles both UIBuffCell and GPUIBuffCell)
+              if (!s_gpuiGetUidResolved) {
+                s_gpuiGetUidResolved = true;
+                void *cellClass = il2cpp_object_get_class(cell);
+                void *cur = cellClass;
+                while (cur && !s_gpuiGetUid) {
+                  s_gpuiGetUid = FindMethod(cur, "get_buffInstanceUid", 0);
+                  if (!s_gpuiGetUid) cur = il2cpp_class_get_parent(cur);
+                }
+                Log("[DIAG] Resolved cell get_buffInstanceUid: %p (class=%s)",
+                    s_gpuiGetUid,
+                    cellClass ? il2cpp_class_get_name(cellClass) : "null");
+              }
+              void *uidMethod = s_gpuiGetUid ? s_gpuiGetUid : g_getBuffInstanceUid;
+              if (!uidMethod) continue;
+
+              void *boxedUid = Invoke(uidMethod, cell);
+              if (!boxedUid) continue;
+              uint32_t cellUid = *(uint32_t *)((char *)boxedUid + 16);
+              g_displayUids[newDisplayCount++] = cellUid;
+              
+              // Stack count is read from m_stackBuffsDict (stackCounts array above)
+              // _buffStackCountText doesn't work for GPUI cells
+
+              // Check if we already have this buff from hooks (match by instUid or by buff id)
+              bool found = false;
+              for (int bi = 0; bi < g_buffCount; bi++) {
+                if (g_buffs[bi].instUid == cellUid) {
+                  ActiveBuff copy = g_buffs[bi];
+                  // Use m_stackBuffsDict count as primary source for stack count
+                  for (int si = 0; si < stackCountN; si++) {
+                    if (strcmp(stackCounts[si].id, copy.id) == 0) {
+                      copy.enhanceCnt = stackCounts[si].count;
+                      break;
+                    }
+                  }
+
+                  newBuffs[newBuffCount++] = copy;
+                  found = true;
+                  break;
+                }
+              }
+              // If not matched by instUid, try matching by buff id (object may have been recycled)
+              if (!found) {
                 for (int bi = 0; bi < g_buffCount; bi++) {
-                  if (g_buffs[bi].instUid == cellUid) {
-                    if (uiStackCount > 1) g_buffs[bi].enhanceCnt = uiStackCount;
-                    found = true;
-                    break;
-                  }
-                }
-                if (!found && g_buffCount < 64) {
-                  void *buffPtr = *(void **)((char *)cell + 0x58);
-                  if (buffPtr) {
-                    struct { void *b; uint32_t u; } dummy = { buffPtr, cellUid };
-                    ActiveBuff ab = {};
-                    ReadBuffData(&dummy, &ab);
-                    ab.source = 2; // Source = LateTick fallback
-                    if (uiStackCount > 1) ab.enhanceCnt = uiStackCount;
-                    g_buffs[g_buffCount++] = ab;
-                  }
-                }
-              }
-              g_displayCount = newDisplayCount;
+                  if (g_buffs[bi].id[0] && strcmp(g_buffs[bi].id, "") != 0) {
+                    // We need the buff data from the cell to compare ids
+                    // Read buff from cell first
+                    void *cellBuff = nullptr;
+                    if (s_cellBuffPtrOffset > 0) {
+                      __try { cellBuff = *(void **)((char *)cell + s_cellBuffPtrOffset); } __except(1) {}
+                    }
+                    if (cellBuff) {
+                      char cellId[128] = {};
+                      __try {
+                        void *idStr = *(void **)((char *)cellBuff + 0x140);
+                        if (idStr) ReadStr(idStr, cellId, sizeof(cellId));
+                      } __except(1) {}
+                      if (cellId[0] && strcmp(g_buffs[bi].id, cellId) == 0) {
+                        ActiveBuff copy = g_buffs[bi];
+                        copy.instUid = cellUid;
+                        copy.buffObj = cellBuff;
+                        for (int si = 0; si < stackCountN; si++) {
+                          if (strcmp(stackCounts[si].id, copy.id) == 0) {
+                            copy.enhanceCnt = stackCounts[si].count;
+                            break;
+                          }
+                        }
 
-              // Remove any tracked buffs NOT in the game's display list
-              // (handles dungeon entry/exit, scene changes, etc.)
-              for (int bi = g_buffCount - 1; bi >= 0; bi--) {
-                if (g_buffs[bi].duration >= 100000.0f)
-                  continue; // keep permanent/hidden
-                bool inDisplay = false;
-                for (int di = 0; di < newDisplayCount; di++) {
-                  if (g_buffs[bi].instUid == g_displayUids[di]) {
-                    inDisplay = true;
-                    break;
+                        newBuffs[newBuffCount++] = copy;
+                        found = true;
+                        break;
+                      }
+                    }
                   }
                 }
-                if (!inDisplay) {
-                  g_buffs[bi] = g_buffs[--g_buffCount];
-                }
               }
-            } else if (size == 0) {
-              // Game list is empty - clear everything visible
-              g_displayCount = 0;
-              for (int bi = g_buffCount - 1; bi >= 0; bi--) {
-                if (g_buffs[bi].duration < 100000.0f) {
-                  g_buffs[bi] = g_buffs[--g_buffCount];
+              // Not found from hooks — read buff data directly from cell
+              if (!found && newBuffCount < 64) {
+                // Dynamically resolve m_buffPtr offset from cell's class
+                if (s_cellBuffPtrOffset == -2) {
+                  void *cellClass = il2cpp_object_get_class(cell);
+                  const char *buffPtrNames[] = {"m_buffPtr", "_buffPtr", "buffPtr"};
+                  s_cellBuffPtrOffset = FindFieldInHierarchy(cellClass, buffPtrNames, 3);
+                  Log("[DIAG] Cell m_buffPtr offset: 0x%X (class=%s)",
+                      s_cellBuffPtrOffset,
+                      cellClass ? il2cpp_class_get_name(cellClass) : "null");
+                }
+                void *buffPtr = nullptr;
+                if (s_cellBuffPtrOffset > 0) {
+                  __try {
+                    // ObjectPtr<Buff> is a struct: first field is the object pointer
+                    buffPtr = *(void **)((char *)cell + s_cellBuffPtrOffset);
+                  } __except(1) {}
+                }
+                if (buffPtr) {
+                  struct { void *b; uint32_t u; } dummy = { buffPtr, cellUid };
+                  ActiveBuff ab = {};
+                  ReadBuffData(&dummy, &ab);
+                  ab.source = 2; // from display scan
+                  // Apply stack count from m_stackBuffsDict
+                  for (int si = 0; si < stackCountN; si++) {
+                    if (strcmp(stackCounts[si].id, ab.id) == 0) {
+                      ab.enhanceCnt = stackCounts[si].count;
+                      break;
+                    }
+                  }
+                  newBuffs[newBuffCount++] = ab;
+                } else {
+                  // Create placeholder entry so display count matches
+                  ActiveBuff ab = {};
+                  ab.instUid = cellUid;
+                  ab.source = 2;
+                  ab.enhanceCnt = 1;
+                  newBuffs[newBuffCount++] = ab;
                 }
               }
             }
+            // Replace g_buffs entirely with display-scanned list
+            // Buffs not in the game's cell list are not for the current character
+            memcpy(g_buffs, newBuffs, sizeof(ActiveBuff) * newBuffCount);
+            g_buffCount = newBuffCount;
+            g_displayCount = newDisplayCount;
           }
-        } __except (1) { /* ignore */
         }
-      }
+      } __except (1) { /* ignore */ }
     }
-    LeaveCriticalSection(&g_buffLock);
   }
+  LeaveCriticalSection(&g_buffLock);
 
   // Lazy-load s_attributesToModify mapping (static field only available after game init)
   if (!g_satmLoaded && g_satmField && il2cpp_field_static_get_value) {
@@ -1483,11 +1813,32 @@ DWORD WINAPI MainThread(LPVOID) {
   if ((m = FindMethod(hpClass, "_ClearMainChar", 0)))
     Hook(m, "ClearMainChar", (void *)hkClearMainChar, (void **)&oClearMainChar);
 
+  // Resolve MainCharHpBar.buffNode field offset dynamically
+  if (hpClass) {
+    const char *bnNames[] = {"buffNode", "_buffNode", "m_buffNode"};
+    const char *bnMatch = nullptr;
+    g_offHpBar_buffNode = FindFieldInHierarchy(hpClass, bnNames, 3, &bnMatch);
+    if (g_offHpBar_buffNode >= 0)
+      Log("[OK] MainCharHpBar.buffNode offset=0x%X (field=%s)", g_offHpBar_buffNode, bnMatch);
+    else
+      Log("[WARN] MainCharHpBar.buffNode NOT found, display order will use fallback");
+  }
+
   // Resolve UIBuffCell.get_buffInstanceUid for display order tracking
   void *buffCellClass = FindClass("Beyond.UI", "UIBuffCell", asms, ac);
   if (buffCellClass) {
     g_getBuffInstanceUid = FindMethod(buffCellClass, "get_buffInstanceUid", 0);
     Log("[OK] UIBuffCell.get_buffInstanceUid: %p", g_getBuffInstanceUid);
+  }
+
+  // Hook GPUIBuffNode._OnBuffEnhanceChanged for stack tracking
+  void *gpuiBuffNodeClass = FindClass("Beyond.UI", "GPUIBuffNode", asms, ac);
+  if (gpuiBuffNodeClass) {
+    if ((m = FindMethod(gpuiBuffNodeClass, "_OnBuffEnhanceChanged", 1)))
+      Hook(m, "GpuiEnhance", (void *)hkGpuiEnhance, (void **)&oGpuiEnhance);
+    Log("[OK] GPUIBuffNode._OnBuffEnhanceChanged hooked: %p", m);
+  } else {
+    Log("[WARN] GPUIBuffNode class not found");
   }
 
   // Resolve UIBuffNode.m_orderedBuffCellList field offset
@@ -1504,6 +1855,16 @@ DWORD WINAPI MainThread(LPVOID) {
         break;
       }
     }
+  }
+
+  // Hook GPUIBuffNode stack methods for independent-instance stacking
+  if (gpuiBuffNodeClass) {
+    if ((m = FindMethod(gpuiBuffNodeClass, "_AddStackBuffIconInternal", 4)))
+      Hook(m, "AddStack", (void *)hkAddStack, (void **)&oAddStack);
+    Log("[OK] GPUIBuffNode._AddStackBuffIconInternal hooked: %p", m);
+    if ((m = FindMethod(gpuiBuffNodeClass, "_RemoveStackBuffIconInternal", 4)))
+      Hook(m, "RemoveStack", (void *)hkRemoveStack, (void **)&oRemoveStack);
+    Log("[OK] GPUIBuffNode._RemoveStackBuffIconInternal hooked: %p", m);
   }
 
   Log("Init complete. Hooks active.");
