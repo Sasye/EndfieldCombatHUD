@@ -1,23 +1,23 @@
 #define APPLEPIE_PLUGIN_IMPL
 #include "applepie_mgr.h"
-#include "MinHook.h"
+#include "applepie_hud.h"
 #include <cstdint>
 #include <cstdio>
+#include <cerrno>
 #include <cstring>
 #include <string>
 #include <vector>
 #include <windows.h>
 
 extern "C" __declspec(dllexport) void DummyExport() {}
-static volatile bool g_pluginActive = true;
-static volatile bool g_langZh = true; // true=Chinese, false=English; toggled by AP_SetLanguage
+static std::atomic<bool> g_langZh = true; // true=Chinese, false=English
 
-// HUD visibility toggles (hotkeys F11/F12, persisted in config)
-static volatile bool g_showSkillHud = true;
-static volatile bool g_showBuffHud = true;
-static volatile bool g_visualEnhance = false; // ready-state glow/pulse (default OFF)
-static int g_vkSkillHud = VK_F11;  // 0x7A
-static int g_vkBuffHud  = VK_F12;  // 0x7B
+// Visibility is runtime state; the key bindings are persistent settings.
+static std::atomic<bool> g_showSkillHud = true;
+static std::atomic<bool> g_showBuffHud = true;
+static std::atomic<bool> g_visualEnhance = false; // ready-state glow/pulse (default OFF)
+static std::atomic<int> g_vkSkillHud = VK_F11;  // 0x7A
+static std::atomic<int> g_vkBuffHud  = VK_F12;  // 0x7B
 
 // Language selector: picks Chinese or English string at zero cost
 #define L(zh, en) (g_langZh ? (zh) : (en))
@@ -53,15 +53,26 @@ void Log(const char *fmt, ...) {
 #include "skill_data.h"
 
 // Forward declarations for config functions (defined in Plugin Manager section)
-static void LoadConfig();
-static void SaveConfig();
+static APH_Result SyncConfig();
+static std::atomic<bool> g_configVisualDirty{false};
+
+struct HudKeyEdge {
+  int binding = -1;
+  bool previous = false;
+  bool Poll(int key, bool down) {
+    if (key != binding) { binding = key; previous = down; return false; }
+    const bool pressed = down && !previous;
+    previous = down;
+    return pressed;
+  }
+};
 
 // ============================================================================
 // Tooltip State (shared between hook thread and overlay thread)
 // ============================================================================
 static HWND g_gameHwnd = nullptr;
 static HWND g_overlayHwnd = nullptr;
-static volatile bool g_running = true;
+static std::atomic<bool> g_running = true;
 
 static char g_tooltipText[2048] = {0};
 static bool g_showTooltip = false;
@@ -78,8 +89,9 @@ static void tooltip_cat(const char *src) {
 // Overlay Window (runs on its own thread - no interference with game)
 // ============================================================================
 static void DrawTooltip(HDC hdc) {
-  if (!g_pluginActive)
+  if (!g_pluginActive || !RuntimeOpen())
     return;
+  if (!g_sceneActive || GetTickCount() - g_lastHpTick.load() > 1500) return;
   if (!g_showTooltip || g_tooltipText[0] == '\0')
     return;
 
@@ -385,6 +397,11 @@ LRESULT CALLBACK OverlayWndProc(HWND hwnd, UINT msg, WPARAM wParam,
   if (msg == WM_ERASEBKGND)
     return 1;
   if (msg == WM_TIMER) {
+    if (!g_pluginActive || !RuntimeOpen()) {
+      ShowWindow(hwnd, SW_HIDE);
+      return 0;
+    }
+    if (g_configVisualDirty.exchange(false)) g_needRepaint = true;
     // Timer fires ~30fps on overlay thread - do hit testing here with pure
     // Win32
     if (!IsWindow(g_gameHwnd)) {
@@ -425,22 +442,24 @@ LRESULT CALLBACK OverlayWndProc(HWND hwnd, UINT msg, WPARAM wParam,
 
     // Hotkey detection (edge-triggered: fires once per keypress)
     {
-      static bool s_prevSkillKey = false;
-      static bool s_prevBuffKey = false;
-      bool curSkill = (GetAsyncKeyState(g_vkSkillHud) & 0x8000) != 0;
-      bool curBuff  = (GetAsyncKeyState(g_vkBuffHud)  & 0x8000) != 0;
-      if (curSkill && !s_prevSkillKey) {
+      static HudKeyEdge skillEdge, buffEdge;
+      static uint64_t hotkeyEpoch = 0;
+      if (hotkeyEpoch != g_epoch) {
+        skillEdge = {}; buffEdge = {}; hotkeyEpoch = g_epoch;
+      }
+      const int skillKey = g_vkSkillHud.load(), buffKey = g_vkBuffHud.load();
+      const bool curSkill = skillKey && (GetAsyncKeyState(skillKey) & 0x8000) != 0;
+      const bool curBuff = buffKey && (GetAsyncKeyState(buffKey) & 0x8000) != 0;
+      if (skillEdge.Poll(skillKey, curSkill)) {
         g_showSkillHud = !g_showSkillHud;
         g_needRepaint = true;
         Log("[HOTKEY] Skill HUD: %s", g_showSkillHud ? "ON" : "OFF");
       }
-      if (curBuff && !s_prevBuffKey) {
+      if (buffEdge.Poll(buffKey, curBuff)) {
         g_showBuffHud = !g_showBuffHud;
         g_needRepaint = true;
         Log("[HOTKEY] Buff HUD: %s", g_showBuffHud ? "ON" : "OFF");
       }
-      s_prevSkillKey = curSkill;
-      s_prevBuffKey = curBuff;
     }
 
     // Sync overlay to content-tight region (not fullscreen)
@@ -1150,8 +1169,7 @@ LRESULT CALLBACK OverlayWndProc(HWND hwnd, UINT msg, WPARAM wParam,
     // Track visibility state changes — force repaint when HUD should hide/show
     {
       // Consume hook-triggered visibility change
-      if (g_visibilityChanged) {
-        g_visibilityChanged = false;
+      if (g_visibilityChanged.exchange(false)) {
         g_needRepaint = true;
       }
       // Also detect gradual alpha changes (fade animations)
@@ -1175,20 +1193,20 @@ LRESULT CALLBACK OverlayWndProc(HWND hwnd, UINT msg, WPARAM wParam,
 // ============================================================================
 // Hooks - MINIMAL work, no Unity API calls, no Win32 calls
 // ============================================================================
-typedef void (*tProgressBar)(void *, void *, void *, void *, void *);
-static tProgressBar oProgressBar = nullptr;
-static void *g_activeHpBar = nullptr; // The MainCharHpBar of the currently active (controlled) character
-void hkProgressBar(void *self, void *p1, void *p2, void *p3, void *mi) {
+
+static constexpr auto oProgressBar = ProgressHook::Original;
+
+void hkProgressBar(void *self, BuffRef p1, bool p2, int32_t p3, void *mi) {
   // Only process buffs from the active character's HpBar
   // When g_activeHpBar is null (before first LateTick), skip all —
   // display scan fallback will read visible buffs directly from cells
-  if (!g_activeHpBar || self != g_activeHpBar) {
+  if (!g_activeHpBar || (uintptr_t)self != g_activeHpBar.load()) {
     oProgressBar(self, p1, p2, p3, mi);
     return;
   }
   uintptr_t isAdd = (uintptr_t)p2;
   ActiveBuff ab = {};
-  ReadBuffData(p1, &ab);
+  ReadBuffData(&p1, &ab);
 
 
 
@@ -1202,12 +1220,13 @@ void hkProgressBar(void *self, void *p1, void *p2, void *p3, void *mi) {
       if (g_buffs[i].instUid == ab.instUid) {
         // Exact same instance — update in place
         ab.source = g_buffs[i].source;
+        ab.buffObj = nullptr;
         g_buffs[i] = ab;
         merged = true;
         break;
       } else if (strcmp(g_buffs[i].id, ab.id) == 0 && strcmp(g_buffs[i].iconName, ab.iconName) == 0) {
         // Same buff type via ProgressBar — replace old instance
-        g_buffs[i].buffObj = ab.buffObj;
+        g_buffs[i].buffObj = nullptr;
         g_buffs[i].instUid = ab.instUid;
         g_buffs[i].duration = ab.duration;
         g_buffs[i].lifeTime = ab.lifeTime;
@@ -1217,6 +1236,7 @@ void hkProgressBar(void *self, void *p1, void *p2, void *p3, void *mi) {
     }
     if (!merged && g_buffCount < 64) {
       ab.source = 0; // ProgressBar = buff
+      ab.buffObj = nullptr;
       g_buffs[g_buffCount++] = ab;
     }
     LeaveCriticalSection(&g_buffLock);
@@ -1235,17 +1255,16 @@ void hkProgressBar(void *self, void *p1, void *p2, void *p3, void *mi) {
 
 // Same logic for _OnBuffIconChange (debuffs like elemental attachments use this
 // path)
-typedef void (*tBuffIconChange)(void *, void *, void *, void *, void *);
-static tBuffIconChange oBuffIconChange = nullptr;
-void hkBuffIconChange(void *self, void *p1, void *p2, void *p3, void *mi) {
+static constexpr auto oBuffIconChange = BuffIconHook::Original;
+void hkBuffIconChange(void *self, BuffRef p1, bool p2, int32_t p3, void *mi) {
   // Only process buffs from the active character's HpBar
-  if (!g_activeHpBar || self != g_activeHpBar) {
+  if (!g_activeHpBar || (uintptr_t)self != g_activeHpBar.load()) {
     oBuffIconChange(self, p1, p2, p3, mi);
     return;
   }
   uintptr_t isAdd = (uintptr_t)p2;
   ActiveBuff ab = {};
-  ReadBuffData(p1, &ab);
+  ReadBuffData(&p1, &ab);
 
 
 
@@ -1269,6 +1288,7 @@ void hkBuffIconChange(void *self, void *p1, void *p2, void *p3, void *mi) {
     }
     if (!found && g_buffCount < 64) {
       ab.source = 1; // BuffIcon = debuff
+      ab.buffObj = nullptr;
       g_buffs[g_buffCount++] = ab;
     }
     LeaveCriticalSection(&g_buffLock);
@@ -1285,13 +1305,12 @@ void hkBuffIconChange(void *self, void *p1, void *p2, void *p3, void *mi) {
   oBuffIconChange(self, p1, p2, p3, mi);
 }
 
-typedef void (*tEnhance)(void *, void *, void *);
-static tEnhance oEnhance = nullptr;
-static tEnhance oGpuiEnhance = nullptr;
+static constexpr auto oEnhance = EnhanceHook::Original;
+static constexpr auto oGpuiEnhance = GpuiEnhanceHook::Original;
 
-void hkEnhanceCommon(void *p1) {
+void hkEnhanceCommon(BuffRef p1) {
   ActiveBuff ab = {};
-  ReadBuffData(p1, &ab);
+  ReadBuffData(&p1, &ab);
 
   EnterCriticalSection(&g_buffLock);
   for (int i = 0; i < g_buffCount; i++) {
@@ -1310,52 +1329,64 @@ void hkEnhanceCommon(void *p1) {
   LeaveCriticalSection(&g_buffLock);
 }
 
-void hkEnhance(void *self, void *p1, void *mi) {
+void hkEnhance(void *self, BuffRef p1, void *mi) {
   hkEnhanceCommon(p1);
   oEnhance(self, p1, mi);
 }
-void hkGpuiEnhance(void *self, void *p1, void *mi) {
+void hkGpuiEnhance(void *self, BuffRef p1, void *mi) {
   hkEnhanceCommon(p1);
   oGpuiEnhance(self, p1, mi);
 }
 
 // Hook GPUIBuffNode stack operations (passthrough — stack counts read from m_stackBuffsDict)
-typedef void (*tAddStack)(void *, void *, bool, void *, void *, void *);
-static tAddStack oAddStack = nullptr;
-void hkAddStack(void *self, void *p1, bool playAnim, void *buffData, void *group, void *mi) {
+static constexpr auto oAddStack = AddStackHook::Original;
+void hkAddStack(void *self, BuffRef p1, bool playAnim, void *buffData, void *group, void *mi) {
   oAddStack(self, p1, playAnim, buffData, group, mi);
 }
-typedef void (*tRemoveStack)(void *, void *, int, void *, void *, void *);
-static tRemoveStack oRemoveStack = nullptr;
-void hkRemoveStack(void *self, void *p1, int finishReason, void *buffData, void *group, void *mi) {
+static constexpr auto oRemoveStack = RemoveStackHook::Original;
+void hkRemoveStack(void *self, BuffRef p1, int32_t finishReason, void *buffData, void *group, void *mi) {
   oRemoveStack(self, p1, finishReason, buffData, group, mi);
 }
 
 // Hook for _ClearMainChar - clears all buffs when entering dungeon/switching char
-typedef void (*tClearMainChar)(void *, void *);
-static tClearMainChar oClearMainChar = nullptr;
+static constexpr auto oClearMainChar = ClearHook::Original;
 void hkClearMainChar(void *self, void *mi) {
   EnterCriticalSection(&g_buffLock);
   g_buffCount = 0;
   g_displayCount = 0;
   LeaveCriticalSection(&g_buffLock);
   // The HpBar being cleared IS the new active character's HpBar
-  g_activeHpBar = self;
+  g_activeHpBar = (uintptr_t)self;
   Log("[CLEAR] All buffs cleared, activeHpBar=%p", self);
   oClearMainChar(self, mi);
 }
 
-typedef void (*tLateTick)(void *, float, void *);
-static tLateTick oLateTick = nullptr;
+static constexpr auto oLateTick = LateTickHook::Original;
 
 void hkLateTick(void *self, float dt, void *mi) {
   oLateTick(self, dt, mi);
 
   // Plugin Manager: skip processing when paused
-  if (!g_pluginActive) return;
+  if (!GameReadAllowed()) return;
 
   // Track which MainCharHpBar is active (the one LateTick is called on)
-  g_activeHpBar = self;
+  if (g_activeHpBar.exchange((uintptr_t)self) != (uintptr_t)self) {
+    EnterCriticalSection(&g_buffLock);
+    g_buffCount = g_displayCount = 0;
+    LeaveCriticalSection(&g_buffLock);
+    s_cgResolved = false;
+    s_cgGetAlpha = nullptr;
+  }
+  // Discover pre-existing panels once per binding. Subsequent OnHide/OnShow
+  // events remain authoritative even when a hidden component keeps ticking.
+  if (g_mainCharHpBarPtr != self) {
+    g_mainCharHpBarPtr = self; // identity comparison only, never dereferenced
+    g_sceneActive = PanelActive(self);
+    g_cgAlpha = 1.0f;
+    s_cgResolved = false;
+    s_cgGetAlpha = nullptr;
+  }
+  g_lastHpTick = GetTickCount();
 
   // Read CanvasGroup alpha on game thread (safe) — overlay thread reads g_cgAlpha
   if (g_offHpBar_fadeCtrl >= 0) {
@@ -1367,7 +1398,10 @@ void hkLateTick(void *self, float dt, void *mi) {
         if (!s_cgResolved) {
           s_cgResolved = true;
           void *k = il2cpp_object_get_class(cgObj);
-          if (k) s_cgGetAlpha = FindMethod(k, "get_alpha", 0);
+          if (k) {
+            s_cgGetAlpha = FindMethod(k, "get_alpha", 0);
+            if (!ValidateMethod(s_cgGetAlpha, "System.Single", {})) s_cgGetAlpha = nullptr;
+          }
         }
         if (s_cgGetAlpha) {
           g_cgAlpha = SDirectFloat(s_cgGetAlpha, cgObj);
@@ -1378,69 +1412,24 @@ void hkLateTick(void *self, float dt, void *mi) {
 
   // Wall-clock throttle: every ~1000ms (not frame-based, since at 200fps
   // a 60-frame counter fires every 300ms — 3x too often)
-  static DWORD s_lastTickMs = 0;
   DWORD now = GetTickCount();
-  if (now - s_lastTickMs < 1000) return;
-  s_lastTickMs = now;
+  if (now - g_lastBuffScan < 1000) return;
+  g_lastBuffScan = now;
 
 
   EnterCriticalSection(&g_buffLock);
-  // Remove expired buffs + refresh lifeTime + refresh attrs for tooltip
-  // NOTE: Do NOT check m_isFinished — the game recycles buff objects to pools
-  // and sets m_isFinished even when the buff effect persists with a new instance.
-  for (int i = g_buffCount - 1; i >= 0; i--) {
-    // Refresh lifeTime (validates pointer via SEH)
-    if (g_buffs[i].buffObj && g_getLifeTime) {
-      __try {
-        void *boxedLife = Invoke(g_getLifeTime, g_buffs[i].buffObj);
-        if (boxedLife) {
-          float life = *(float *)((char *)boxedLife + 0x10);
-          g_buffs[i].lifeTime = life;
-          if (g_buffs[i].duration < 100000.0f && life <= 0.0f) {
-            g_buffs[i] = g_buffs[--g_buffCount];
-            continue;
-          }
-        }
-      } __except(1) {
-        // Object pointer invalid (GC'd/recycled) — null it out but KEEP the buff.
-        // Cached id/duration/lifeTime/attrs are still valid.
-        // Buff will only be removed by explicit isAdd=false callback.
-        g_buffs[i].buffObj = nullptr;
-      }
-    }
-    // Re-read attributes from loader (pure memory read, no invoke)
-    if (g_buffs[i].buffObj && g_loaderOffset > 0) {
-      __try {
-        void *loader = *(void **)((char *)g_buffs[i].buffObj + g_loaderOffset);
-        if (loader) {
-          auto readArr = [](void *ldr, int off, float *dst, int max) {
-            void *arr = *(void **)((char *)ldr + off);
-            if (!arr) return;
-            int32_t len = *(int32_t *)((char *)arr + 0x18);
-            if (len <= 0 || len > max) return;
-            double *data = (double *)((char *)arr + 0x20);
-            for (int j = 0; j < len && j < max; j++)
-              dst[j] = (float)data[j];
-          };
-          readArr(loader, g_offAmlAdd, g_buffs[i].attrs.add, 96);
-          readArr(loader, g_offAmlBaseAdd, g_buffs[i].attrs.baseAdd, 96);
-          readArr(loader, g_offAmlFinalAdd, g_buffs[i].attrs.finalAdd, 96);
-          readArr(loader, g_offAmlBaseFinalAdd, g_buffs[i].attrs.baseFinalAdd, 96);
-          readArr(loader, g_offAmlMul, g_buffs[i].attrs.mul, 96);
-          readArr(loader, g_offAmlBaseMul, g_buffs[i].attrs.baseMul, 96);
-          readArr(loader, g_offAmlFinalScl, g_buffs[i].attrs.finalScl, 96);
-          readArr(loader, g_offAmlBaseFinalScl, g_buffs[i].attrs.baseFinalScl, 96);
-        }
-      } __except(1) {}
-    }
-  }
-
+  __try {
+  // g_buffs contains value snapshots only; live cell references are borrowed
+  // and copied during this callback, never held for the next one.
   // Read display order from buff node's m_orderedBuffCellList
   // Try GPUIBuffNode first (game update switched to GPUI), then UIBuffNode fallback
   if (g_getBuffInstanceUid) {
     void *buffNode = nullptr;
     int listOffset = 0;
     bool buffNodeIsGpui = false;
+    void* emptyNode = nullptr;
+    int emptyListOffset = 0;
+    bool emptyIsGpui = false;
 
     // Prefer reflected MainCharHpBar/GPUIBuffNode fields. Legacy offsets remain
     // available only when reflection could not resolve a field.
@@ -1457,10 +1446,12 @@ void hkLateTick(void *self, float dt, void *mi) {
         void *ol = *(void **)((char *)gpui + gpuiListOffset);
         if (ol) {
           int sz = *(int *)((char *)ol + 0x18);
-          if (sz > 0) {
+          if (sz > 0 && sz <= 64) {
             buffNode = gpui;
             listOffset = gpuiListOffset;
             buffNodeIsGpui = true;
+          } else if (sz == 0) {
+            emptyNode = gpui; emptyListOffset = gpuiListOffset; emptyIsGpui = true;
           }
         }
       }
@@ -1478,9 +1469,11 @@ void hkLateTick(void *self, float dt, void *mi) {
           void *ol = *(void **)((char *)uibn + g_orderedListOffset);
           if (ol) {
             int sz = *(int *)((char *)ol + 0x18);
-            if (sz > 0) {
+            if (sz > 0 && sz <= 64) {
               buffNode = uibn;
               listOffset = (int)g_orderedListOffset;
+            } else if (sz == 0 && !emptyNode) {
+              emptyNode = uibn; emptyListOffset = (int)g_orderedListOffset;
             }
           }
         }
@@ -1498,22 +1491,29 @@ void hkLateTick(void *self, float dt, void *mi) {
           void *ol = *(void **)((char *)uibn + 0xA8);
           if (ol) {
             int sz = *(int *)((char *)ol + 0x18);
-            if (sz > 0) {
+            if (sz > 0 && sz <= 64) {
               buffNode = uibn;
               listOffset = 0xA8;
+            } else if (sz == 0 && !emptyNode) {
+              emptyNode = uibn; emptyListOffset = 0xA8;
             }
           }
         }
       } __except(1) {}
     }
 
+    // A nonempty legacy node takes precedence over an unused empty GPUI node.
+    // If both are empty, publish that empty snapshot to discard stale buffs.
+    if (!buffNode && emptyNode) {
+      buffNode = emptyNode; listOffset = emptyListOffset; buffNodeIsGpui = emptyIsGpui;
+    }
     if (buffNode) {
       __try {
         void *orderedList = *(void **)((char *)buffNode + listOffset);
         if (orderedList) {
           void *items = *(void **)((char *)orderedList + 0x10);
           int size = *(int *)((char *)orderedList + 0x18);
-          if (items && size >= 0 && size <= 64) {
+          if ((items || size == 0) && size >= 0 && size <= 64) {
             int newDisplayCount = 0;
             // Temporary array to rebuild g_buffs from display
             ActiveBuff newBuffs[64];
@@ -1580,137 +1580,50 @@ void hkLateTick(void *self, float dt, void *mi) {
               }
             } __except(1) {}
 
-            void **elements = (void **)((char *)items + 0x20);
-            // Resolve get_buffInstanceUid dynamically from first cell's class
-            static void *s_gpuiGetUid = nullptr;
-            static bool s_gpuiGetUidResolved = false;
-            static int s_cellBuffPtrOffset = -2; // -2 = not resolved
-
-            for (int ci = 0; ci < size; ci++) {
+            void **elements = items ? (void **)((char *)items + 0x20) : nullptr;
+            // These are metadata caches keyed by the actual concrete class.
+            static void *cellClassCache = nullptr, *uidMethod = nullptr;
+            static int cellBuffOffset = -1;
+            for (int ci = 0; ci < size; ++ci) {
               void *cell = elements[ci];
               if (!cell) continue;
-
-              // Resolve method from actual cell class (handles both UIBuffCell and GPUIBuffCell)
-              if (!s_gpuiGetUidResolved) {
-                s_gpuiGetUidResolved = true;
-                void *cellClass = il2cpp_object_get_class(cell);
-                void *cur = cellClass;
-                while (cur && !s_gpuiGetUid) {
-                  s_gpuiGetUid = FindMethod(cur, "get_buffInstanceUid", 0);
-                  if (!s_gpuiGetUid) cur = il2cpp_class_get_parent(cur);
-                }
-                Log("[DIAG] Resolved cell get_buffInstanceUid: %p (class=%s)",
-                    s_gpuiGetUid,
-                    cellClass ? il2cpp_class_get_name(cellClass) : "null");
+              void *klass = il2cpp_object_get_class(cell);
+              if (klass != cellClassCache) {
+                cellClassCache = klass;
+                uidMethod = nullptr;
+                for (void *k = klass; k && !uidMethod; k = il2cpp_class_get_parent(k))
+                  uidMethod = FindMethod(k, "get_buffInstanceUid", 0);
+                const char *names[] = {"m_buffPtr", "_buffPtr", "buffPtr"};
+                cellBuffOffset = FindFieldInHierarchy(klass, names, 3);
               }
-              void *uidMethod = s_gpuiGetUid ? s_gpuiGetUid : g_getBuffInstanceUid;
-              if (!uidMethod) continue;
-
-              void *boxedUid = Invoke(uidMethod, cell);
+              void *boxedUid = Invoke(uidMethod ? uidMethod : g_getBuffInstanceUid, cell);
               if (!boxedUid) continue;
-              uint32_t cellUid = *(uint32_t *)((char *)boxedUid + 16);
-              g_displayUids[newDisplayCount++] = cellUid;
-              
-              // Stack count is read from m_stackBuffsDict (stackCounts array above)
-              // _buffStackCountText doesn't work for GPUI cells
-
-              // Check if we already have this buff from hooks (match by instUid or by buff id)
-              bool found = false;
-              for (int bi = 0; bi < g_buffCount; bi++) {
-                if (g_buffs[bi].instUid == cellUid) {
-                  ActiveBuff copy = g_buffs[bi];
-                  // Use m_stackBuffsDict count as primary source for stack count
-                  for (int si = 0; si < stackCountN; si++) {
-                    if (strcmp(stackCounts[si].id, copy.id) == 0) {
-                      copy.enhanceCnt = stackCounts[si].count;
-                      break;
-                    }
-                  }
-
-                  newBuffs[newBuffCount++] = copy;
-                  found = true;
+              uint32_t uid = *(uint32_t*)((char*)boxedUid + 16);
+              g_displayUids[newDisplayCount++] = uid;
+              ActiveBuff ab{};
+              bool refreshed = false;
+              if (cellBuffOffset >= 0) {
+                BuffRef ref = *(BuffRef*)((char*)cell + cellBuffOffset);
+                // A recycled cell's ObjectPtr must still describe this UID.
+                if (ref.object && ref.uid == uid) {
+                  ReadBuffData(&ref, &ab);
+                  refreshed = ab.id[0] != 0;
+                }
+              }
+              if (!refreshed) {
+                for (int bi = 0; bi < g_buffCount; ++bi) {
+                  if (g_buffs[bi].instUid == uid) { ab = g_buffs[bi]; break; }
+                }
+              }
+              ab.instUid = uid;
+              ab.buffObj = nullptr; // snapshot only
+              ab.source = 2;
+              for (int si = 0; si < stackCountN; ++si)
+                if (!strcmp(stackCounts[si].id, ab.id)) {
+                  ab.enhanceCnt = stackCounts[si].count;
                   break;
                 }
-              }
-              // If not matched by instUid, try matching by buff id (object may have been recycled)
-              if (!found) {
-                for (int bi = 0; bi < g_buffCount; bi++) {
-                  if (g_buffs[bi].id[0] && strcmp(g_buffs[bi].id, "") != 0) {
-                    // We need the buff data from the cell to compare ids
-                    // Read buff from cell first
-                    void *cellBuff = nullptr;
-                    if (s_cellBuffPtrOffset > 0) {
-                      __try { cellBuff = *(void **)((char *)cell + s_cellBuffPtrOffset); } __except(1) {}
-                    }
-                    if (cellBuff) {
-                      char cellId[128] = {};
-                      __try {
-                        void *idStr = nullptr;
-                        if (g_buffIdOffset > 0)
-                          idStr = *(void **)((char *)cellBuff + g_buffIdOffset);
-                        else
-                          idStr = *(void **)((char *)cellBuff + 0x140);
-                        if (idStr) ReadStr(idStr, cellId, sizeof(cellId));
-                      } __except(1) {}
-                      if (cellId[0] && strcmp(g_buffs[bi].id, cellId) == 0) {
-                        ActiveBuff copy = g_buffs[bi];
-                        copy.instUid = cellUid;
-                        copy.buffObj = cellBuff;
-                        for (int si = 0; si < stackCountN; si++) {
-                          if (strcmp(stackCounts[si].id, copy.id) == 0) {
-                            copy.enhanceCnt = stackCounts[si].count;
-                            break;
-                          }
-                        }
-
-                        newBuffs[newBuffCount++] = copy;
-                        found = true;
-                        break;
-                      }
-                    }
-                  }
-                }
-              }
-              // Not found from hooks — read buff data directly from cell
-              if (!found && newBuffCount < 64) {
-                // Dynamically resolve m_buffPtr offset from cell's class
-                if (s_cellBuffPtrOffset == -2) {
-                  void *cellClass = il2cpp_object_get_class(cell);
-                  const char *buffPtrNames[] = {"m_buffPtr", "_buffPtr", "buffPtr"};
-                  s_cellBuffPtrOffset = FindFieldInHierarchy(cellClass, buffPtrNames, 3);
-                  Log("[DIAG] Cell m_buffPtr offset: 0x%X (class=%s)",
-                      s_cellBuffPtrOffset,
-                      cellClass ? il2cpp_class_get_name(cellClass) : "null");
-                }
-                void *buffPtr = nullptr;
-                if (s_cellBuffPtrOffset > 0) {
-                  __try {
-                    // ObjectPtr<Buff> is a struct: first field is the object pointer
-                    buffPtr = *(void **)((char *)cell + s_cellBuffPtrOffset);
-                  } __except(1) {}
-                }
-                if (buffPtr) {
-                  struct { void *b; uint32_t u; } dummy = { buffPtr, cellUid };
-                  ActiveBuff ab = {};
-                  ReadBuffData(&dummy, &ab);
-                  ab.source = 2; // from display scan
-                  // Apply stack count from m_stackBuffsDict
-                  for (int si = 0; si < stackCountN; si++) {
-                    if (strcmp(stackCounts[si].id, ab.id) == 0) {
-                      ab.enhanceCnt = stackCounts[si].count;
-                      break;
-                    }
-                  }
-                  newBuffs[newBuffCount++] = ab;
-                } else {
-                  // Create placeholder entry so display count matches
-                  ActiveBuff ab = {};
-                  ab.instUid = cellUid;
-                  ab.source = 2;
-                  ab.enhanceCnt = 1;
-                  newBuffs[newBuffCount++] = ab;
-                }
-              }
+              newBuffs[newBuffCount++] = ab;
             }
             // Replace g_buffs entirely with display-scanned list
             // Buffs not in the game's cell list are not for the current character
@@ -1722,8 +1635,6 @@ void hkLateTick(void *self, float dt, void *mi) {
       } __except (1) { /* ignore */ }
     }
   }
-  LeaveCriticalSection(&g_buffLock);
-
   // Lazy-load s_attributesToModify mapping (static field only available after game init)
   // Re-check if only a few entries were loaded (game populates array gradually)
   if (g_satmField && il2cpp_field_static_get_value && (!g_satmLoaded || g_satmLen < 10)) {
@@ -1745,12 +1656,13 @@ void hkLateTick(void *self, float dt, void *mi) {
       }
     }
   }
+  } __finally { LeaveCriticalSection(&g_buffLock); }
 }
 
 // ============================================================================
 // Overlay Thread - completely separate from game thread
 // ============================================================================
-DWORD WINAPI OverlayThread(LPVOID) {
+static APH_Result RunOverlay(uint64_t epoch) {
   // Set per-thread DPI awareness so we get real pixel coordinates
   // (without this, coordinates are virtualized on 125%/150%/200% displays)
   typedef DPI_AWARENESS_CONTEXT (WINAPI *tSetThreadDpiAwarenessContext)(DPI_AWARENESS_CONTEXT);
@@ -1767,7 +1679,8 @@ DWORD WINAPI OverlayThread(LPVOID) {
 
   // Find game window belonging to THIS process (not any other Unity app)
   DWORD myPid = GetCurrentProcessId();
-  while (g_running && !g_gameHwnd) {
+  g_gameHwnd = nullptr;
+  while (EnableOpen(epoch) && !g_gameHwnd && GetTickCount64() < g_enableDeadline) {
     struct FindCtx { DWORD pid; HWND result; } ctx = { myPid, nullptr };
     EnumWindows([](HWND hw, LPARAM lp) -> BOOL {
       auto *c = (FindCtx *)lp;
@@ -1783,10 +1696,10 @@ DWORD WINAPI OverlayThread(LPVOID) {
       return TRUE;
     }, (LPARAM)&ctx);
     g_gameHwnd = ctx.result;
-    if (!g_gameHwnd) Sleep(500);
+    if (!g_gameHwnd) WaitForSingleObject(g_cancel, 50);
   }
-  if (!g_gameHwnd)
-    return 0;
+  if (!g_gameHwnd || !EnableOpen(epoch)) return APH_E_UNAVAILABLE;
+  g_gameThread = GetWindowThreadProcessId(g_gameHwnd, nullptr);
   Log("[OK] Game window found: %p (PID=%u)", g_gameHwnd, myPid);
 
   WNDCLASSA wc = {0};
@@ -1794,7 +1707,7 @@ DWORD WINAPI OverlayThread(LPVOID) {
   wc.hInstance = GetModuleHandle(NULL);
   wc.lpszClassName = "BuffTooltipOverlay";
   wc.hbrBackground = (HBRUSH)GetStockObject(BLACK_BRUSH);
-  RegisterClassA(&wc);
+  if (!RegisterClassA(&wc) && GetLastError() != ERROR_CLASS_ALREADY_EXISTS) return APH_E_UNAVAILABLE;
 
   RECT clientRect;
   GetClientRect(g_gameHwnd, &clientRect);
@@ -1803,8 +1716,9 @@ DWORD WINAPI OverlayThread(LPVOID) {
 
   g_overlayHwnd = CreateWindowExA(
       WS_EX_LAYERED | WS_EX_TRANSPARENT | WS_EX_TOPMOST | WS_EX_NOACTIVATE | WS_EX_TOOLWINDOW,
-      wc.lpszClassName, "", WS_POPUP | WS_VISIBLE, pt.x, pt.y, clientRect.right,
+      wc.lpszClassName, "", WS_POPUP, pt.x, pt.y, clientRect.right,
       clientRect.bottom, NULL, NULL, wc.hInstance, NULL);
+  if (!g_overlayHwnd) return APH_E_UNAVAILABLE;
   SetLayeredWindowAttributes(g_overlayHwnd, RGB(0, 0, 0), 0, LWA_COLORKEY);
 
   Log("[OK] Overlay window created: %p", g_overlayHwnd);
@@ -1859,65 +1773,49 @@ DWORD WINAPI OverlayThread(LPVOID) {
       Log("[INFO] Foreground window is not the game (class=%s) — this is normal with launcher overlays", fgClass);
   }
 
-  // Initial render so the window isn't blank until first timer tick
-  RenderOverlay(g_overlayHwnd);
-
-  // Timer for hit-testing + direct render (~33ms = 30Hz polling)
-  SetTimer(g_overlayHwnd, 1, 33, NULL);
-
-  MSG msg;
-  while (GetMessage(&msg, NULL, 0, 0)) {
-    TranslateMessage(&msg);
-    DispatchMessage(&msg);
+  APH_Result result = APH_E_UNAVAILABLE;
+  if (SetTimer(g_overlayHwnd, 1, 33, NULL)) {
+    AcquireSRWLockExclusive(&g_workerLock);
+    if (EnableOpen(epoch)) {
+      result = g_client.CompleteEnable(epoch, APH_OK);
+      if (result == APH_OK) g_pluginActive = true;
+    }
+    ReleaseSRWLockExclusive(&g_workerLock);
   }
-
-  if (g_overlayHwnd)
-    DestroyWindow(g_overlayHwnd);
-  return 0;
+  if (result == APH_OK) {
+    ShowWindow(g_overlayHwnd, SW_SHOWNOACTIVATE);
+    g_needRepaint = true;
+    bool quit = false;
+    while (!quit && RuntimeOpen() && WaitForSingleObject(g_cancel, 0) == WAIT_TIMEOUT) {
+      DWORD wait = MsgWaitForMultipleObjects(1, &g_cancel, FALSE, 100, QS_ALLINPUT);
+      if (wait == WAIT_OBJECT_0 || wait == WAIT_FAILED) break;
+      MSG msg{};
+      while (PeekMessageW(&msg, nullptr, 0, 0, PM_REMOVE)) {
+        if (msg.message == WM_QUIT) { quit = true; break; }
+        TranslateMessage(&msg);
+        DispatchMessageW(&msg);
+      }
+    }
+  }
+  KillTimer(g_overlayHwnd, 1);
+  DestroyWindow(g_overlayHwnd);
+  g_overlayHwnd = nullptr;
+  if (s_memDC) {
+    SelectObject(s_memDC, s_oldBmp);
+    DeleteObject(s_memBmp);
+    DeleteDC(s_memDC);
+    s_memDC = nullptr; s_memBmp = s_oldBmp = nullptr;
+    s_memW = s_memH = 0;
+  }
+  if (s_skillFont) { DeleteObject(s_skillFont); s_skillFont = nullptr; s_skillLastH = 0; }
+  UnregisterClassA(wc.lpszClassName, wc.hInstance);
+  return result;
 }
 
 // ============================================================================
 // Main Thread - Il2Cpp init + hooks only
 // ============================================================================
-DWORD WINAPI MainThread(LPVOID) {
-  char p[MAX_PATH];
-  GetModuleFileNameA(NULL, p, MAX_PATH);
-  std::string d(p);
-  size_t pos = d.find_last_of("\\/");
-  if (pos != std::string::npos)
-    d = d.substr(0, pos + 1);
-  std::string logPath = d + "plugin\\buff_sniff_log.txt";
-  g_logHandle = CreateFileA(logPath.c_str(), GENERIC_WRITE, FILE_SHARE_READ, NULL,
-                            CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL | FILE_FLAG_WRITE_THROUGH, NULL);
-
-  Log("=== EndfieldCombatHUD ===");
-  for (int i = 0; i < 120; i++) {
-    if (GetModuleHandleW(L"GameAssembly.dll"))
-      break;
-    Sleep(1000);
-  }
-  // Wait for IL2CPP to finish initializing exports (retry instead of fixed delay)
-  {
-    bool resolved = false;
-    for (int attempt = 0; attempt < 30; attempt++) {
-      Sleep(1000);
-      if (Resolve()) {
-        resolved = true;
-        Log("[OK] IL2CPP resolved after %d seconds", attempt + 1);
-        break;
-      }
-    }
-    if (!resolved) {
-      Log("[FATAL] IL2CPP resolve failed after 30 retries");
-      return 1;
-    }
-  }
-
-  void *dom = il2cpp_domain_get();
-  il2cpp_thread_attach(dom);
-  size_t ac = 0;
-  void **asms = il2cpp_domain_get_assemblies(dom, &ac);
-
+static bool ResolveHudMetadata(void** asms, size_t ac) {
   void *buffClass = FindClass("Beyond.Gameplay.Core", "Buff", asms, ac);
   if (buffClass) {
     g_getId = FindMethod(buffClass, "get_id", 0);
@@ -2046,7 +1944,7 @@ DWORD WINAPI MainThread(LPVOID) {
     Log("  AttributeModifierLoader fields:");
     while ((amlField = il2cpp_class_get_fields(amlClass, &amlIter))) {
       const char* afname = il2cpp_field_get_name(amlField);
-      int afoff = il2cpp_field_get_offset(amlField);
+      int afoff = (int)il2cpp_field_get_offset(amlField);
       if (!afname) continue;
       Log("    [0x%X] %s", afoff, afname);
 
@@ -2080,23 +1978,22 @@ DWORD WINAPI MainThread(LPVOID) {
 
 
   void *hpClass = FindClass("Beyond.UI", "MainCharHpBar", asms, ac);
-  if (MH_Initialize() != MH_OK) {
-    Log("[FATAL] MH_Initialize failed");
-    return 1;
-  }
-  InitializeCriticalSection(&g_buffLock);
-
   void *m;
-  if ((m = FindMethod(hpClass, "_OnProgressBarBuffChange", 3)))
-    Hook(m, "ProgressBar", (void *)hkProgressBar, (void **)&oProgressBar);
-  if ((m = FindMethod(hpClass, "_OnBuffIconChange", 3)))
-    Hook(m, "BuffIcon", (void *)hkBuffIconChange, (void **)&oBuffIconChange);
-  if ((m = FindMethod(hpClass, "_OnBuffEnhanceChanged", 1)))
-    Hook(m, "Enhance", (void *)hkEnhance, (void **)&oEnhance);
-  if ((m = FindMethod(hpClass, "LateTick", 1)))
-    Hook(m, "LateTick", (void *)hkLateTick, (void **)&oLateTick);
-  if ((m = FindMethod(hpClass, "_ClearMainChar", 0)))
-    Hook(m, "ClearMainChar", (void *)hkClearMainChar, (void **)&oClearMainChar);
+  m = FindMethod(hpClass, "_OnProgressBarBuffChange", 3);
+  if (!QueueHudHook<ProgressHook>(m, 1, "ProgressBar", hkProgressBar,
+        "void(self,ObjectPtr<Buff>16,bool,i32,MethodInfo*)", {"Beyond.ObjectPtr<Beyond.Gameplay.Core.Buff>", "System.Boolean", "Beyond.Gameplay.Core.Buff.FinishReason"})) return false;
+  m = FindMethod(hpClass, "_OnBuffIconChange", 3);
+  if (!QueueHudHook<BuffIconHook>(m, 2, "BuffIcon", hkBuffIconChange,
+        "void(self,ObjectPtr<Buff>16,bool,i32,MethodInfo*)", {"Beyond.ObjectPtr<Beyond.Gameplay.Core.Buff>", "System.Boolean", "Beyond.Gameplay.Core.Buff.FinishReason"})) return false;
+  m = FindMethod(hpClass, "_OnBuffEnhanceChanged", 1);
+  if (!QueueHudHook<EnhanceHook>(m, 3, "Enhance", hkEnhance,
+        "void(self,ObjectPtr<Buff>16,MethodInfo*)", {"Beyond.ObjectPtr<Beyond.Gameplay.Core.Buff>"})) return false;
+  m = FindMethod(hpClass, "LateTick", 1);
+  if (!QueueHudHook<LateTickHook>(m, 8, "LateTick", hkLateTick,
+        "void(self,f32,MethodInfo*)", {"System.Single"})) return false;
+  m = FindMethod(hpClass, "_ClearMainChar", 0);
+  if (!QueueHudHook<ClearHook>(m, 7, "ClearMainChar", hkClearMainChar,
+        "void(self,MethodInfo*)", {})) return false;
 
   // Resolve MainCharHpBar.buffNode field offset dynamically
   if (hpClass) {
@@ -2165,8 +2062,9 @@ DWORD WINAPI MainThread(LPVOID) {
     else
       Log("[WARN] GPUIBuffNode stack dictionary not found, using legacy offset 0xA8");
 
-    if ((m = FindMethod(gpuiBuffNodeClass, "_OnBuffEnhanceChanged", 1)))
-      Hook(m, "GpuiEnhance", (void *)hkGpuiEnhance, (void **)&oGpuiEnhance);
+    m = FindMethod(gpuiBuffNodeClass, "_OnBuffEnhanceChanged", 1);
+    if (!QueueHudHook<GpuiEnhanceHook>(m, 4, "GpuiEnhance", hkGpuiEnhance,
+        "void(self,ObjectPtr<Buff>16,MethodInfo*)", {"Beyond.ObjectPtr<Beyond.Gameplay.Core.Buff>"})) return false;
     Log("[OK] GPUIBuffNode._OnBuffEnhanceChanged hooked: %p", m);
   } else {
     Log("[WARN] GPUIBuffNode class not found");
@@ -2207,43 +2105,30 @@ DWORD WINAPI MainThread(LPVOID) {
 
   // Hook GPUIBuffNode stack methods for independent-instance stacking
   if (gpuiBuffNodeClass) {
-    if ((m = FindMethod(gpuiBuffNodeClass, "_AddStackBuffIconInternal", 4)))
-      Hook(m, "AddStack", (void *)hkAddStack, (void **)&oAddStack);
+    m = FindMethod(gpuiBuffNodeClass, "_AddStackBuffIconInternal", 4);
+    if (!QueueHudHook<AddStackHook>(m, 5, "AddStack", hkAddStack,
+        "void(self,ObjectPtr<Buff>16,bool,BuffData*,BuffCellGroup*,MethodInfo*)", {"Beyond.ObjectPtr<Beyond.Gameplay.Core.Buff>", "System.Boolean", "Beyond.Gameplay.Core.BuffData", "Beyond.UI.GPUIBuffNode.BuffCellGroup"})) return false;
     Log("[OK] GPUIBuffNode._AddStackBuffIconInternal hooked: %p", m);
-    if ((m = FindMethod(gpuiBuffNodeClass, "_RemoveStackBuffIconInternal", 4)))
-      Hook(m, "RemoveStack", (void *)hkRemoveStack, (void **)&oRemoveStack);
+    m = FindMethod(gpuiBuffNodeClass, "_RemoveStackBuffIconInternal", 4);
+    if (!QueueHudHook<RemoveStackHook>(m, 6, "RemoveStack", hkRemoveStack,
+        "void(self,ObjectPtr<Buff>16,i32,BuffData*,BuffCellGroup*,MethodInfo*)", {"Beyond.ObjectPtr<Beyond.Gameplay.Core.Buff>", "Beyond.Gameplay.Core.Buff.FinishReason", "Beyond.Gameplay.Core.BuffData", "Beyond.UI.GPUIBuffNode.BuffCellGroup"})) return false;
     Log("[OK] GPUIBuffNode._RemoveStackBuffIconInternal hooked: %p", m);
   }
 
-  Log("Init complete. Hooks active.");
-
-  // ========== Phase 2: Skill HUD hooks ==========
-  InitSkillHooks(asms, ac);
-
-  // Load config (hotkey bindings, visual_enhance setting)
-  LoadConfig();
-  SaveConfig(); // create default file if it doesn't exist
-
-  // Start overlay thread AFTER game is fully loaded
-  CreateThread(NULL, 0, OverlayThread, NULL, 0, NULL);
-  Log("Overlay thread started.");
-
-  return 0;
+  if (!buffClass || !hpClass || !g_getId || !g_getDuration || !g_getLifeTime) return false;
+  return InitSkillHooks(asms, ac);
 }
 
-BOOL APIENTRY DllMain(HMODULE h, DWORD r, LPVOID) {
-  if (r == DLL_PROCESS_ATTACH) {
-    DisableThreadLibraryCalls(h);
-    InitializeCriticalSection(&g_logLock);
-    CreateThread(NULL, 0, MainThread, NULL, 0, NULL);
-  }
-  return TRUE;
-}
+BOOL APIENTRY DllMain(HMODULE, DWORD, LPVOID) { return TRUE; }
 
 // ============================================================================
-// Config File (plugin\combat_hud_config.txt)
+// Basic settings. The old file is read only for the first import.
 // ============================================================================
 static char g_configPath[MAX_PATH] = {};
+static SRWLOCK g_configLock = SRWLOCK_INIT;
+static APH_ConfigApi g_configApi{};
+static HANDLE g_configChanged;
+static bool g_configImportPending;
 
 static void InitConfigPath() {
     if (g_configPath[0]) return;
@@ -2255,45 +2140,136 @@ static void InitConfigPath() {
     snprintf(g_configPath, sizeof(g_configPath), "%splugin\\combat_hud_config.txt", d.c_str());
 }
 
-static void LoadConfig() {
-    InitConfigPath();
-    FILE *f = fopen(g_configPath, "r");
-    if (!f) return;
-    char line[256];
-    while (fgets(line, sizeof(line), f)) {
-        char key[128]; char val[128];
-        if (sscanf(line, "%127[^=]=%127s", key, val) == 2) {
-            if (strcmp(key, "toggle_skill_hud") == 0) g_vkSkillHud = (int)strtol(val, NULL, 0);
-            else if (strcmp(key, "toggle_buff_hud") == 0) g_vkBuffHud = (int)strtol(val, NULL, 0);
-            else if (strcmp(key, "visual_enhance") == 0) g_visualEnhance = (atoi(val) != 0);
+static APH_Result SyncConfig() {
+    if (!g_configApi.snapshot) return APH_E_UNAVAILABLE;
+    AcquireSRWLockExclusive(&g_configLock);
+    __try {
+        APH_ConfigSnapshot state{};
+        APH_ConfigValue values[4]{};
+        APH_Result r = g_configApi.snapshot(g_client.owner(), sizeof(state), &state, 4, values);
+        if (r != APH_OK) return r;
+        if (g_configImportPending) {
+            if (state.pending) return APH_PENDING;
+            if (state.last_result != APH_OK) return state.last_result;
+            g_configImportPending = false;
         }
-    }
-    fclose(f);
-    Log("[CONFIG] Loaded: skill_hud=0x%X buff_hud=0x%X visual_enhance=%d",
-        g_vkSkillHud, g_vkBuffHud, (int)g_visualEnhance);
+        g_vkSkillHud = values[0].integer; g_vkBuffHud = values[1].integer;
+        g_visualEnhance = values[2].integer != 0; g_langZh = !strcmp(values[3].text, "zh");
+        g_configVisualDirty = true;
+        return APH_OK;
+    } __finally { ReleaseSRWLockExclusive(&g_configLock); }
+}
+static void APH_CALL ConfigChanged(APH_Owner, void*) {
+    // The notification updates atomics only; the overlay consumes the repaint
+    // flag on its own thread. No window or game operation runs in this callback.
+    SyncConfig();
+    SetEvent(g_configChanged);
 }
 
-static void SaveConfig() {
-    InitConfigPath();
-    FILE *f = fopen(g_configPath, "w");
-    if (!f) return;
-    fprintf(f, "toggle_skill_hud=0x%X\n", g_vkSkillHud);
-    fprintf(f, "toggle_buff_hud=0x%X\n", g_vkBuffHud);
-    fprintf(f, "visual_enhance=%d\n", (int)g_visualEnhance);
+static APH_Result ReadLegacyConfig(APH_ConfigValue (&values)[4], bool& found) {
+    found = false;
+    FILE* f = fopen(g_configPath, "rb");
+    if (!f) return errno == ENOENT ? APH_OK : APH_E_IO;
+    found = true;
+    char line[512]; APH_Result result = APH_OK;
+    while (fgets(line, sizeof(line), f)) {
+        char key[128], value[128];
+        const char* input = strlen(line) >= 3 && !memcmp(line, "\xef\xbb\xbf", 3) ? line + 3 : line;
+        if (sscanf(input, " %127[^= \t] = %127s", key, value) != 2) continue;
+        int index = !strcmp(key, "toggle_skill_hud") ? 0 : !strcmp(key, "toggle_buff_hud") ? 1 : !strcmp(key, "visual_enhance") ? 2 : -1;
+        if (index < 0) continue;
+        errno = 0; char* end = nullptr; const long number = strtol(value, &end, 0);
+        if (errno || end == value || *end || number < 0 || number > (index == 2 ? 1 : 255)) { result = APH_E_ARGUMENT; break; }
+        values[index].integer = int(number);
+    }
+    if (ferror(f)) result = APH_E_IO;
     fclose(f);
+    return result;
+}
+
+static APH_Result RegisterConfig() {
+    APH_Result r = g_client.Service(g_configApi);
+    if (r != APH_OK) return r;
+    if (!g_configApi.set_notifier) return APH_E_UNAVAILABLE;
+    HMODULE module = nullptr; wchar_t path[MAX_PATH];
+    if (!GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+        reinterpret_cast<LPCWSTR>(&RegisterConfig), &module)) return APH_E_UNAVAILABLE;
+    const DWORD n = GetModuleFileNameW(module, path, MAX_PATH);
+    if (!n || n >= MAX_PATH) return APH_E_UNAVAILABLE;
+    wchar_t* slash = wcsrchr(path, L'\\'); if (!slash) return APH_E_UNAVAILABLE;
+    if (wcscpy_s(slash + 1, MAX_PATH - (slash + 1 - path), L"config\\applepie.combat_hud.ini")) return APH_E_UNAVAILABLE;
+    const DWORD attributes = GetFileAttributesW(path);
+    const DWORD error = attributes == INVALID_FILE_ATTRIBUTES ? GetLastError() : ERROR_SUCCESS;
+    if (error && error != ERROR_FILE_NOT_FOUND && error != ERROR_PATH_NOT_FOUND) return APH_E_IO;
+    APH_ConfigField fields[4]{};
+    const char* keys[]{"toggle_skill_hud", "toggle_buff_hud", "visual_enhance", "language"};
+    const char* labels[]{"Skill HUD key / 技能 HUD 快捷键", "Buff HUD key / Buff HUD 快捷键", "Visual effects / 视觉增强", "Language / 语言"};
+    const APH_ConfigOption languages[]{{"zh"}, {"en"}};
+    for (unsigned i = 0; i < 4; ++i) {
+        auto& f = fields[i]; f.size = sizeof(f);
+        f.type = f.initial.type = i < 2 ? APH_CONFIG_KEY : i == 2 ? APH_CONFIG_BOOL : APH_CONFIG_ENUM;
+        strcpy_s(f.key, keys[i]); strcpy_s(f.label, labels[i]);
+        if (i < 2) {
+            f.initial.integer = i == 0 ? VK_F11 : VK_F12;
+            strcpy_s(f.description, "Click and press a key; Clear disables it / 点击后按键，清除可禁用");
+        }
+    }
+    fields[3].options = languages; fields[3].option_count = 2; strcpy_s(fields[3].initial.text, "zh");
+    APH_ConfigValue imported[4]{};
+    for (unsigned i = 0; i < 4; ++i) imported[i] = fields[i].initial;
+    bool importLegacy = false;
+    if (attributes == INVALID_FILE_ATTRIBUTES) {
+        r = ReadLegacyConfig(imported, importLegacy);
+        if (r != APH_OK) return r;
+    }
+    const APH_ConfigSchema schema{sizeof(schema), 4, fields};
+    r = g_configApi.register_schema(g_client.owner(), &schema);
+    if (r != APH_OK) return r;
+    g_configChanged = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+    if (!g_configChanged) return APH_E_UNAVAILABLE;
+    r = g_configApi.set_notifier(g_client.owner(), ConfigChanged, nullptr);
+    if (r != APH_OK) { CloseHandle(g_configChanged); g_configChanged = nullptr; return r; }
+    if (importLegacy) {
+        APH_ConfigSnapshot state{};
+        r = g_configApi.snapshot(g_client.owner(), sizeof(state), &state, 0, nullptr);
+        if (r != APH_OK) return r;
+        AcquireSRWLockExclusive(&g_configLock);
+        g_configImportPending = true;
+        ReleaseSRWLockExclusive(&g_configLock);
+        r = g_configApi.save(g_client.owner(), state.revision, 4, imported);
+        if (r != APH_PENDING && r != APH_OK) return r;
+        Log("[CONFIG] Importing legacy settings into Manager configuration");
+        return APH_OK;
+    }
+    return SyncConfig();
+}
+
+static APH_Result SaveLanguage(bool chinese) {
+    if (!g_configApi.snapshot) return APH_E_UNAVAILABLE;
+    AcquireSRWLockExclusive(&g_configLock);
+    __try {
+        APH_ConfigSnapshot state{}; APH_ConfigValue values[4]{};
+        APH_Result r = g_configApi.snapshot(g_client.owner(), sizeof(state), &state, 4, values);
+        if (r != APH_OK) return r;
+        if (state.pending || g_configImportPending) return APH_E_BUSY;
+        const char* language = chinese ? "zh" : "en";
+        if (!strcmp(values[3].text, language)) return APH_OK;
+        strcpy_s(values[3].text, language);
+        return g_configApi.save(g_client.owner(), state.revision, 4, values);
+    } __finally { ReleaseSRWLockExclusive(&g_configLock); }
 }
 
 // ============================================================================
 // Plugin Manager Interface
 // ============================================================================
-static AP_HotkeyInfo s_hotkeys[2];
+
 
 static AP_PluginInfo s_pluginInfo = {
     APPLEPIE_PLUGIN_API_VERSION,
     "combat_hud",
     "Combat HUD \xe6\x88\x98\xe6\x96\x97\xe4\xbf\xa1\xe6\x81\xaf",        // 战斗信息
     "\xe6\x98\xbe\xe7\xa4\xba" "Buff\xe8\xaf\xa6\xe6\x83\x85\xe4\xb8\x8e\xe5\xb1\x9e\xe6\x80\xa7\xe5\x8a\xa0\xe6\x88\x90",  // 显示Buff详情与属性加成
-    "combat_hud_config.txt",
+    "config/applepie.combat_hud.ini",
     true  // supports hot disable
 };
 
@@ -2305,39 +2281,214 @@ APPLEPIE_PLUGIN_EXPORT AP_PluginInfo* AP_GetPluginInfo() {
     return &s_pluginInfo;
 }
 
-APPLEPIE_PLUGIN_EXPORT bool AP_PluginEnable() {
-    g_pluginActive = true;
-    return true;
-}
-
-APPLEPIE_PLUGIN_EXPORT bool AP_PluginDisable() {
-    g_pluginActive = false;
-    return true;
-}
-
 APPLEPIE_PLUGIN_EXPORT void AP_SetLanguage(const char* langCode) {
-    bool wasZh = g_langZh;
-    g_langZh = (langCode && langCode[0] == 'z');
-    if (wasZh != g_langZh)
-        Log("[LANG] Language switched to: %s", g_langZh ? "zh" : "en");
+    const APH_Result result = SaveLanguage(langCode && langCode[0] == 'z');
+    if (result < 0) Log("[LANG] Language save not accepted: %d", result);
 }
 
 APPLEPIE_PLUGIN_EXPORT int AP_GetHotkeys(AP_HotkeyInfo* outArray, int maxCount) {
-    s_hotkeys[0] = {
+    if (!outArray || maxCount <= 0) return 0;
+    AP_HotkeyInfo hotkeys[2]{};
+    hotkeys[0] = {
         L("\xe5\x88\x87\xe6\x8d\xa2\xe6\x8a\x80\xe8\x83\xbd\xe6\x98\xbe\xe7\xa4\xba", "Toggle Skill HUD"),  // 切换技能显示
         "toggle_skill_hud", g_vkSkillHud
     };
-    s_hotkeys[1] = {
+    hotkeys[1] = {
         L("\xe5\x88\x87\xe6\x8d\xa2" "Buff\xe6\x98\xbe\xe7\xa4\xba", "Toggle Buff HUD"),  // 切换Buff显示
         "toggle_buff_hud", g_vkBuffHud
     };
     int count = 2;
     if (count > maxCount) count = maxCount;
-    for (int i = 0; i < count; i++) outArray[i] = s_hotkeys[i];
+    for (int i = 0; i < count; i++) outArray[i] = hotkeys[i];
     return count;
 }
 
 APPLEPIE_PLUGIN_EXPORT bool AP_ReloadConfig() {
-    LoadConfig();
-    return true;
+    return SyncConfig() == APH_OK;
+}
+
+// SDK lifecycle: one cancellable worker owns initialization and the overlay.
+// It never invokes gameplay methods. Metadata queries run on an attached
+// IL2CPP worker; actual getters execute only inside verified UI callbacks.
+static APH_Result InitializeHud(uint64_t epoch) {
+  while (EnableOpen(epoch) && GetTickCount64() < g_enableDeadline) {
+    if (Resolve()) break;
+    // A loaded PE's exports do not appear later. Fail closed if a required
+    // readiness probe is absent, rather than falling back to domain_get.
+    if (hGA) return APH_E_UNAVAILABLE;
+    WaitForSingleObject(g_cancel, 50);
+  }
+  if (!hGA || !EnableOpen(epoch) || GetTickCount64() >= g_enableDeadline)
+    return APH_E_UNAVAILABLE;
+  bool stopInstalled = false;
+  APH_NativeProc shutdown = (APH_NativeProc)GetProcAddress(hGA, "il2cpp_shutdown");
+  if (shutdown) {
+    APH_Result r = ShutdownHook::Install(epoch, shutdown, "void() C-export", "il2cpp.runtime.shutdown");
+    if (r != APH_OK) return r;
+    stopInstalled = true;
+  }
+  Log("[APH] Waiting for IL2CPP corlib and an existing registered VM thread before domain/attach/metadata");
+  while (EnableOpen(epoch) && GetTickCount64() < g_enableDeadline && !WorkerAttachReady())
+    WaitForSingleObject(g_cancel, 50);
+  if (!EnableOpen(epoch) || GetTickCount64() >= g_enableDeadline) {
+    Log("[APH] IL2CPP startup wait ended before readiness: epoch=%llu", (unsigned long long)epoch);
+    return APH_E_UNAVAILABLE;
+  }
+  Log("[APH] IL2CPP worker readiness confirmed; starting metadata discovery");
+  void* domain = nullptr;
+  while (EnableOpen(epoch) && GetTickCount64() < g_enableDeadline) {
+    domain = il2cpp_domain_get();
+    if (domain) break;
+    WaitForSingleObject(g_cancel, 50);
+  }
+  if (!domain || !EnableOpen(epoch) || GetTickCount64() >= g_enableDeadline)
+    return APH_E_UNAVAILABLE;
+  void* thread = il2cpp_thread_attach(domain);
+  if (!thread) return APH_E_UNAVAILABLE;
+  __try {
+    size_t count = 0;
+    void** assemblies = nullptr;
+    while (EnableOpen(epoch) && GetTickCount64() < g_enableDeadline) {
+      assemblies = il2cpp_domain_get_assemblies(domain, &count);
+      if (assemblies && count && FindClass("Beyond.UI", "MainCharHpBar", assemblies, count)) break;
+      WaitForSingleObject(g_cancel, 50);
+    }
+    if (!assemblies || !count || !EnableOpen(epoch) || GetTickCount64() >= g_enableDeadline)
+      return APH_E_UNAVAILABLE;
+    void* application = FindClass("UnityEngine", "Application", assemblies, count);
+    void* quit = FindMethod(application, "Internal_ApplicationQuit", 0);
+    if (ValidateMethod(quit, "System.Void", {}, true)) {
+      APH_Result r = QuitHook::Install(epoch, (APH_NativeProc)((MInfo*)quit)->mp,
+          "void(MethodInfo*) static", "unity.Application.Internal_ApplicationQuit");
+      if (r != APH_OK) return r;
+      stopInstalled = true;
+    }
+    if (!stopInstalled) return APH_E_UNAVAILABLE;
+    if (!ResolveHudMetadata(assemblies, count)) return APH_E_SIGNATURE;
+    return EnableOpen(epoch) ? APH_OK : APH_E_REVOKED;
+  } __finally {
+    // Once shutdown starts the runtime owns destruction of its threads.
+    if (RuntimeOpen()) il2cpp_thread_detach(thread);
+  }
+}
+
+static DWORD WINAPI HudWorker(void* parameter) {
+  const uint64_t epoch = (uint64_t)(uintptr_t)parameter;
+  APH_Result result = APH_E_FAULT;
+  try {
+    result = APH_PENDING;
+    while (EnableOpen(epoch) && GetTickCount64() < g_enableDeadline) {
+      result = SyncConfig();
+      if (result != APH_PENDING) break;
+      const ULONGLONG now = GetTickCount64();
+      if (now >= g_enableDeadline) break;
+      const HANDLE signals[]{g_cancel, g_configChanged};
+      if (WaitForMultipleObjects(2, signals, FALSE, DWORD(g_enableDeadline - now)) != WAIT_OBJECT_0 + 1) {
+        result = APH_E_UNAVAILABLE; break;
+      }
+    }
+    if (!EnableOpen(epoch) || GetTickCount64() >= g_enableDeadline) result = APH_E_UNAVAILABLE;
+    if (result == APH_OK) result = InitializeHud(epoch);
+    if (result == APH_OK) result = RunOverlay(epoch);
+  } catch (...) { result = APH_E_FAULT; } // local C++ boundary, /EHsc only
+  g_pluginActive = false;
+  if (result != APH_OK) {
+    Log("[APH] Enable epoch=%llu ended: %d", (unsigned long long)epoch, result);
+    g_client.CompleteEnable(epoch, result); // stale completion is rejected by Core
+  } else {
+    g_client.Disable(); // also drain after window destruction / runtime stop
+  }
+  return 0;
+}
+
+static void ResetHudSnapshots() {
+  // Called only with native business drained AND our worker signalled.
+  g_activeHpBar = 0;
+  g_gameThread = 0;
+  g_gameHwnd = nullptr;
+  g_mainCharHpBarPtr = nullptr;
+  g_buffCount = g_displayCount = 0;
+  memset(g_buffs, 0, sizeof(g_buffs));
+  g_skillHud = MakeEmptyHudState();
+  memset(g_comboState, 0, sizeof(g_comboState));
+  memset(g_lastSkillUpdate, 0, sizeof(g_lastSkillUpdate));
+  g_lastBuffScan = 0;
+  g_sceneActive = g_combatActive = false;
+  g_cgAlpha = 0.0f;
+  g_lastHpTick = g_lastComboTick = 0;
+  g_uspMethodsResolved = s_cgResolved = false;
+  g_mGetUltimateSp = g_mGetMaxUltimateSp = s_cgGetAlpha = nullptr;
+  g_satmLoaded = false;
+  g_satmLen = 0;
+  g_tooltipText[0] = 0;
+  g_showTooltip = false;
+  g_needRepaint = true;
+}
+
+static void APH_CALL DisablingHud(APH_Owner, uint64_t, void*) {
+  AcquireSRWLockExclusive(&g_workerLock);
+  g_pluginActive = false;
+  SetEvent(g_cancel);
+  ReleaseSRWLockExclusive(&g_workerLock);
+}
+static APH_Result APH_CALL RestoreHud(APH_Owner, const APH_Cleanup* cleanup, void*) {
+  if (!cleanup || cleanup->domains) return APH_E_ARGUMENT;
+  AcquireSRWLockExclusive(&g_workerLock);
+  __try {
+    if (g_worker) {
+      DWORD wait = WaitForSingleObject(g_worker, 0);
+      if (wait == WAIT_TIMEOUT) return APH_PENDING;
+      if (wait != WAIT_OBJECT_0) return APH_E_NEEDS_RESTART;
+      CloseHandle(g_worker);
+      g_worker = nullptr;
+    }
+    ResetHudSnapshots();
+    return APH_OK;
+  } __finally { ReleaseSRWLockExclusive(&g_workerLock); }
+}
+
+extern "C" __declspec(dllexport) const APH_Manifest APH_PluginManifest = {
+  sizeof(APH_Manifest), APH_ABI_MAJOR, APH_ABI_MINOR, APH_ARCH_X64,
+  APH_PLUGIN_LIFECYCLE | APH_PLUGIN_LATE_LOAD | APH_PLUGIN_MODULE_OBSERVER,
+  APH_CAP_CORE | APH_CAP_HOOKS, 0, "combat_hud", "Endfield Combat HUD"
+};
+extern "C" __declspec(dllexport) APH_Result APH_CALL APH_Attach(const APH_AttachArgs* args) {
+  APH_Result r = g_client.Attach(args);
+  if (r != APH_OK) return r;
+  r = g_client.Service(g_runtime);
+  if (r != APH_OK) return r;
+  InitializeCriticalSection(&g_logLock);
+  InitializeCriticalSection(&g_buffLock);
+  InitializeCriticalSection(&g_skillLock);
+  g_cancel = CreateEventW(nullptr, TRUE, TRUE, nullptr);
+  if (!g_cancel) return APH_E_UNAVAILABLE;
+  const APH_LifecycleDesc life{sizeof(life), 60000, DisablingHud, RestoreHud, nullptr};
+  r = g_client.RegisterLifecycle(life);
+  if (r != APH_OK) return r;
+  try {
+    InitConfigPath();
+    char logPath[MAX_PATH]{};
+    strcpy_s(logPath, g_configPath);
+    char* slash = strrchr(logPath, '\\');
+    if (slash) strcpy_s(slash + 1, sizeof(logPath) - (slash + 1 - logPath), "buff_sniff_log.txt");
+    g_logHandle = CreateFileA(logPath, GENERIC_WRITE, FILE_SHARE_READ, nullptr,
+        CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+    r = RegisterConfig();
+  } catch (...) { return APH_E_FAULT; }
+  return r;
+}
+extern "C" __declspec(dllexport) APH_Result APH_CALL APH_Enable(APH_Owner owner, uint64_t epoch) {
+  if (owner != g_client.owner() || !epoch || !g_cancel) return APH_E_ARGUMENT;
+  AcquireSRWLockExclusive(&g_workerLock);
+  __try {
+    if (g_worker || g_stopping.load()) return APH_E_UNAVAILABLE;
+    g_epoch = epoch;
+    g_enableDeadline = GetTickCount64() + 45000;
+    g_pluginActive = false;
+    g_running = true;
+    ResetEvent(g_cancel);
+    g_worker = CreateThread(nullptr, 0, HudWorker, (void*)(uintptr_t)epoch, 0, nullptr);
+    if (!g_worker) { SetEvent(g_cancel); return APH_E_UNAVAILABLE; }
+    return APH_PENDING;
+  } __finally { ReleaseSRWLockExclusive(&g_workerLock); }
 }

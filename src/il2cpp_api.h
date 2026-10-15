@@ -6,7 +6,7 @@
 #include <cstdio>
 #include <cstring>
 #include <windows.h>
-#include "MinHook.h"
+#include <initializer_list>
 
 // Forward decl for Log (defined in main cpp)
 void Log(const char *fmt, ...);
@@ -14,11 +14,30 @@ void Log(const char *fmt, ...);
 // ============================================================================
 // Il2Cpp function pointer declarations
 // ============================================================================
+template<class Signature> struct HudRuntimeFunction;
+template<class R, class... Args> struct HudRuntimeFunction<R(*)(Args...)> {
+  using Pointer = R(*)(Args...);
+  Pointer pointer = nullptr;
+  HudRuntimeFunction& operator=(Pointer value) { pointer = value; return *this; }
+  explicit operator bool() const { return pointer != nullptr; }
+  R operator()(Args... args) const {
+    // Also gate metadata loops and lazy reflection after a stop notification.
+    // Attaching a worker does not permit it to invoke arbitrary game methods.
+    if (!pointer || !RuntimeOpen()) {
+      if constexpr (std::is_void_v<R>) return;
+      else return R{};
+    }
+    return pointer(args...);
+  }
+};
 #define D(ret, name, ...)                                                      \
   typedef ret (*t_##name)(__VA_ARGS__);                                        \
-  static t_##name name = nullptr
+  static HudRuntimeFunction<t_##name> name
+D(void *, il2cpp_get_corlib);
+D(void **, il2cpp_thread_get_all_attached_threads, size_t *);
 D(void *, il2cpp_domain_get);
 D(void *, il2cpp_thread_attach, void *);
+D(void, il2cpp_thread_detach, void *);
 D(void **, il2cpp_domain_get_assemblies, void *, size_t *);
 D(void *, il2cpp_assembly_get_image, void *);
 D(const char *, il2cpp_image_get_name, void *);
@@ -33,6 +52,18 @@ D(void *, il2cpp_object_get_class, void *);
 D(void *, il2cpp_class_from_name, void *, const char *, const char *);
 D(void *, il2cpp_method_get_param, void *, uint32_t);
 D(const char *, il2cpp_type_get_name, void *);
+D(void, il2cpp_free, void *);
+D(int, il2cpp_type_get_type, void *);
+D(bool, il2cpp_type_is_byref, void *);
+D(void *, il2cpp_class_from_type, void *);
+D(bool, il2cpp_class_is_valuetype, void *);
+D(bool, il2cpp_class_is_enum, void *);
+D(int32_t, il2cpp_class_value_size, void *, uint32_t *);
+D(void *, il2cpp_class_enum_basetype, void *);
+D(uint32_t, il2cpp_method_get_flags, void *, uint32_t *);
+D(void *, il2cpp_method_get_return_type, void *);
+D(bool, il2cpp_method_is_generic, void *);
+D(bool, il2cpp_method_is_inflated, void *);
 D(void *, il2cpp_class_get_fields, void *, void **);
 D(const char *, il2cpp_field_get_name, void *);
 D(size_t, il2cpp_field_get_offset, void *);
@@ -78,9 +109,13 @@ static bool Resolve() {
   hGA = GetModuleHandleW(L"GameAssembly.dll");
   if (!hGA)
     return false;
-#define R(n) n = (t_##n)GetProcAddress(hGA, #n)
+#define R(n) n = (t_##n)GetProcAddress(hGA, #n); \
+  if (!n) { Log("[APH] Missing required IL2CPP export: %s", #n); return false; }
+  R(il2cpp_get_corlib);
+  R(il2cpp_thread_get_all_attached_threads);
   R(il2cpp_domain_get);
   R(il2cpp_thread_attach);
+  R(il2cpp_thread_detach);
   R(il2cpp_domain_get_assemblies);
   R(il2cpp_assembly_get_image);
   R(il2cpp_image_get_name);
@@ -95,6 +130,18 @@ static bool Resolve() {
   R(il2cpp_class_from_name);
   R(il2cpp_method_get_param);
   R(il2cpp_type_get_name);
+  R(il2cpp_free);
+  R(il2cpp_type_get_type);
+  R(il2cpp_type_is_byref);
+  R(il2cpp_class_from_type);
+  R(il2cpp_class_is_valuetype);
+  R(il2cpp_class_is_enum);
+  R(il2cpp_class_value_size);
+  R(il2cpp_class_enum_basetype);
+  R(il2cpp_method_get_flags);
+  R(il2cpp_method_get_return_type);
+  R(il2cpp_method_is_generic);
+  R(il2cpp_method_is_inflated);
   R(il2cpp_class_get_fields);
   R(il2cpp_field_get_name);
   R(il2cpp_field_get_offset);
@@ -105,6 +152,19 @@ static bool Resolve() {
 #undef R
   return il2cpp_domain_get && il2cpp_class_get_methods &&
          il2cpp_method_get_name;
+}
+
+static bool WorkerAttachReady() {
+  // Verified against GameAssembly startup (PE timestamp 0x6A870DA4).
+  // get_corlib is a non-allocating pointer read. Corlib is
+  // published only AFTER GC and the native attached-thread list initialize.
+  // Domain::GetCurrent itself can allocate; do not use it as the first probe.
+  if (!il2cpp_get_corlib || !il2cpp_thread_get_all_attached_threads ||
+      !il2cpp_get_corlib()) return false;
+  size_t count = 0;
+  // A registered VM thread also proves the domain / Thread classes exist.
+  // This mutable array is borrowed: only inspect its count, never its entries.
+  return il2cpp_thread_get_all_attached_threads(&count) && count != 0;
 }
 
 static void *FindMethod(void *k, const char *n, int pc) {
@@ -119,46 +179,82 @@ static void *FindMethod(void *k, const char *n, int pc) {
   return nullptr;
 }
 
+static bool TypeMatches(void* type, const char* expected) {
+  if (!type || il2cpp_type_is_byref(type)) return false;
+  const char* allocated = il2cpp_type_get_name(type);
+  if (!allocated) return false;
+  char name[256]{};
+  size_t n = 0;
+  for (const char* p = allocated; *p && n + 1 < sizeof(name); ++p) {
+    if (*p != ' ') name[n++] = (*p == '/' || *p == '+') ? '.' : *p;
+  }
+  il2cpp_free((void*)allocated);
+  if (strcmp(name, expected)) return false;
+  int kind = il2cpp_type_get_type(type);
+  if (!strcmp(expected, "System.Void")) return kind == 1;
+  if (!strcmp(expected, "System.Boolean")) return kind == 2;
+  if (!strcmp(expected, "System.Int32")) return kind == 8;
+  if (!strcmp(expected, "System.Single")) return kind == 12;
+  void* klass = il2cpp_class_from_type(type);
+  if (!klass) return false;
+  if (!strcmp(expected, "Beyond.ObjectPtr<Beyond.Gameplay.Core.Buff>")) {
+    uint32_t alignment = 0;
+    return kind == 21 && il2cpp_class_is_valuetype(klass) &&
+        il2cpp_class_value_size(klass, &alignment) == sizeof(BuffRef) && alignment == 8;
+  }
+  if (!strcmp(expected, "Beyond.Gameplay.Core.Buff.FinishReason"))
+    return il2cpp_class_is_enum(klass) &&
+        il2cpp_type_get_type(il2cpp_class_enum_basetype(klass)) == 8;
+  return !il2cpp_class_is_valuetype(klass);
+}
+
+static bool ValidateMethod(void* method, const char* result,
+    std::initializer_list<const char*> parameters, bool isStatic = false) {
+  if (!method || !RuntimeOpen() || !((MInfo*)method)->mp ||
+      il2cpp_method_is_generic(method) || il2cpp_method_is_inflated(method) ||
+      il2cpp_method_get_param_count(method) != parameters.size()) return false;
+  uint32_t impl = 0;
+  if (bool(il2cpp_method_get_flags(method, &impl) & 0x10) != isStatic ||
+      !TypeMatches(il2cpp_method_get_return_type(method), result)) return false;
+  uint32_t index = 0;
+  for (const char* expected : parameters)
+    if (!TypeMatches(il2cpp_method_get_param(method, index++), expected)) return false;
+  return true;
+}
+
+template<class H, class Fn> static bool QueueHudHook(void* method, uint64_t key,
+    const char* name, Fn body, const char* signature,
+    std::initializer_list<const char*> parameters) {
+  if (!ValidateMethod(method, "System.Void", parameters)) {
+    Log("[ABI] %s: missing method or incompatible signature", name);
+    return false;
+  }
+  APH_Result r = H::Request(g_client, key, (Fn)((MInfo*)method)->mp, body,
+      signature, name, HudOptions());
+  if (r >= 0) r = AwaitHud(g_epoch, [] { return H::Advance(); });
+  Log("[APH] %s: %d", name, r);
+  return r == APH_OK;
+}
+
 static void *FindClass(const char *ns, const char *n, void **a, size_t c) {
   for (size_t i = 0; i < c; i++) {
+    if (!RuntimeOpen() || WaitForSingleObject(g_cancel, 0) != WAIT_TIMEOUT) return nullptr;
     void *img = il2cpp_assembly_get_image(a[i]);
     if (!img)
       continue;
-    size_t cc = il2cpp_image_get_class_count(img);
-    for (size_t j = 0; j < cc; j++) {
-      void *k = il2cpp_image_get_class(img, j);
-      if (!k)
-        continue;
-      const char *cn = il2cpp_class_get_name(k);
-      if (!cn || strcmp(cn, n) != 0)
-        continue;
-      const char *kns =
-          il2cpp_class_get_namespace ? il2cpp_class_get_namespace(k) : "";
-      if (strcmp(kns ? kns : "", ns) == 0)
-        return k;
-    }
+    // Exact namespace/type lookup avoids scanning every class in the game.
+    if (void* klass = il2cpp_class_from_name(img, ns, n)) return klass;
   }
   return nullptr;
 }
 
-static bool Hook(void *mi, const char *l, void *d, void **o) {
-  if (!mi)
-    return false;
-  void *t = ((MInfo *)mi)->mp;
-  if (!t)
-    return false;
-  if (MH_CreateHook(t, d, o) != MH_OK || MH_EnableHook(t) != MH_OK)
-    return false;
-  Log("[OK] %s hooked", l);
-  return true;
-}
-
 static void *Invoke(void *method, void *obj, void **params = nullptr) {
-  if (!method)
+  if (!method || !GameReadAllowed())
     return nullptr;
   __try {
     void *exc = nullptr;
-    return il2cpp_runtime_invoke(method, obj, params, &exc);
+    void* result = il2cpp_runtime_invoke(method, obj, params, &exc);
+    return exc ? nullptr : result;
   } __except (1) {
     return nullptr;
   }

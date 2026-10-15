@@ -1,6 +1,6 @@
 // clang-format off
 // Forward declaration: language flag defined in combat_hud.cpp
-extern volatile bool g_langZh;
+extern std::atomic<bool> g_langZh;
 
 static const char *GetAttrName(int idx) {
   static const char *const ATTR_NAMES_ZH[] = {

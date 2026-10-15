@@ -96,7 +96,7 @@ static bool SReadBool(void *obj, size_t offset) {
 
 // Invoke a 0-param method that returns a boxed float (SLOW — uses il2cpp_runtime_invoke)
 static float SInvokeFloat(void *method, void *obj) {
-  if (!method || !obj || !il2cpp_runtime_invoke) return 0.0f;
+  if (!method || !obj || !il2cpp_runtime_invoke || !GameReadAllowed()) return 0.0f;
   __try {
     void *exc = nullptr;
     void *boxed = il2cpp_runtime_invoke(method, obj, nullptr, &exc);
@@ -109,7 +109,7 @@ static float SInvokeFloat(void *method, void *obj) {
 // Direct call for 0-param float-returning methods (FAST — no invoke overhead)
 // Uses MInfo->mp native pointer directly, bypassing boxing/unboxing/GC.
 static float SDirectFloat(void *method, void *obj) {
-  if (!method || !obj) return 0.0f;
+  if (!method || !obj || !GameReadAllowed()) return 0.0f;
   void *fn = ((MInfo *)method)->mp;
   if (!fn) return 0.0f;
   __try {
@@ -121,8 +121,7 @@ static float SDirectFloat(void *method, void *obj) {
 // ============================================================================
 // SkillButton.PreTick Hook
 // ============================================================================
-typedef void (*tSkillBtnPreTick)(void *self, void *deltaTime, void *methodInfo);
-static tSkillBtnPreTick oSkillBtnPreTick = nullptr;
+static constexpr auto oSkillBtnPreTick = SkillTickHook::Original;
 
 // Try to lazy-resolve USP methods from the ability system entity class
 static void TryResolveUspMethods(void *entityObj) {
@@ -142,11 +141,11 @@ static void TryResolveUspMethods(void *entityObj) {
         if (!mname) continue;
         if (strcmp(mname, "get_ultimateSp") == 0 &&
             il2cpp_method_get_param_count(method) == 0) {
-          g_mGetUltimateSp = method;
+          if (ValidateMethod(method, "System.Single", {})) g_mGetUltimateSp = method;
         }
         else if (strcmp(mname, "get_maxUltimateSp") == 0 &&
                  il2cpp_method_get_param_count(method) == 0) {
-          g_mGetMaxUltimateSp = method;
+          if (ValidateMethod(method, "System.Single", {})) g_mGetMaxUltimateSp = method;
         }
       }
       searchClass = il2cpp_class_get_parent ? il2cpp_class_get_parent(searchClass) : nullptr;
@@ -170,19 +169,33 @@ static void TryResolveUspMethods(void *entityObj) {
 // HUD shows only when BOTH sceneActive AND combatActive
 // ============================================================================
 
-static volatile bool g_sceneActive = false;  // OnShow/OnHide
-static volatile bool g_combatActive = false; // _OnBattleTeamChanged/OnRelease
-static volatile float g_cgAlpha = 1.0f;      // CanvasGroup alpha (written by game thread)
-static volatile bool g_visibilityChanged = false; // Set by hooks, consumed by timer
+static std::atomic<bool> g_sceneActive = false;  // OnShow/OnHide
+static std::atomic<bool> g_combatActive = false; // _OnBattleTeamChanged/OnRelease
+static std::atomic<float> g_cgAlpha = 1.0f;      // CanvasGroup alpha (written by game thread)
+static std::atomic<bool> g_visibilityChanged = false; // Set by hooks, consumed by timer
 static void *g_mainCharHpBarPtr = nullptr;
 
 // CanvasGroup alpha: method pointer cache (re-resolved when HpBar instance changes)
 static void *s_cgGetAlpha = nullptr;
 static bool  s_cgResolved = false;
 
+static void* g_panelActiveMethod = nullptr;
+static std::atomic<DWORD> g_lastHpTick{0}, g_lastComboTick{0};
+static DWORD g_lastBuffScan = 0, g_lastSkillUpdate[4]{};
+static bool PanelActive(void* panel) {
+  if (!panel || !g_panelActiveMethod || !GameReadAllowed()) return false;
+  using Getter = bool(*)(void*, void*);
+  return ((Getter)((MInfo*)g_panelActiveMethod)->mp)(panel, g_panelActiveMethod);
+}
+static void hkComboPanelTick(void* self, float dt, void* method) {
+  ComboTickHook::Original(self, dt, method);
+  if (!GameReadAllowed()) return;
+  g_combatActive = PanelActive(self);
+  g_lastComboTick = GetTickCount();
+}
+
 // Hook: MainCharHpBar.OnShow — scene HUD appears
-typedef void (*tHpBarOnShow)(void *self, void *methodInfo);
-static tHpBarOnShow oHpBarOnShow = nullptr;
+static constexpr auto oHpBarOnShow = ShowHook::Original;
 
 void hkHpBarOnShow(void *self, void *methodInfo) {
   oHpBarOnShow(self, methodInfo);
@@ -198,23 +211,21 @@ void hkHpBarOnShow(void *self, void *methodInfo) {
 }
 
 // Hook: MainCharHpBar.OnHide — scene HUD hidden (menu open etc)
-typedef void (*tHpBarOnHide)(void *self, void *methodInfo);
-static tHpBarOnHide oHpBarOnHide = nullptr;
+static constexpr auto oHpBarOnHide = HideHook::Original;
 
 void hkHpBarOnHide(void *self, void *methodInfo) {
   oHpBarOnHide(self, methodInfo);
+  g_mainCharHpBarPtr = self;
   g_sceneActive = false;
   g_cgAlpha = 0.0f;
   g_visibilityChanged = true;
 }
 
 // Hook: ComboSkillPanel._OnBattleTeamChanged — entering combat
-typedef void (*tComboPanelBattleChanged)(void *self, void *methodInfo);
-static tComboPanelBattleChanged oComboPanelBattleChanged = nullptr;
+static constexpr auto oComboPanelBattleChanged = BattleHook::Original;
 
 // Forward-declare combo skill cache (used by hooks below, defined in CD reading section)
-static void *g_comboSkillObj[4];
-static void *g_comboAbilityPtr[4];
+
 static SkillSlotStatus g_comboState[4];
 
 void hkComboPanelBattleChanged(void *self, void *methodInfo) {
@@ -222,8 +233,6 @@ void hkComboPanelBattleChanged(void *self, void *methodInfo) {
   // Invalidate all cached skill pointers — handles dungeon restart
   // where game destroys and recreates all ability system objects
   for (int i = 0; i < 4; i++) {
-    g_comboSkillObj[i] = nullptr;
-    g_comboAbilityPtr[i] = nullptr;
     g_comboState[i] = {};
   }
   // Reset CG alpha cache so it re-resolves with new UI objects
@@ -237,8 +246,7 @@ void hkComboPanelBattleChanged(void *self, void *methodInfo) {
 }
 
 // Hook: ComboSkillPanel.OnRelease — leaving combat
-typedef void (*tComboPanelRelease)(void *self, void *methodInfo);
-static tComboPanelRelease oComboPanelRelease = nullptr;
+static constexpr auto oComboPanelRelease = ReleaseHook::Original;
 
 void hkComboPanelRelease(void *self, void *methodInfo) {
   oComboPanelRelease(self, methodInfo);
@@ -251,70 +259,37 @@ void hkComboPanelRelease(void *self, void *methodInfo) {
 
 // (combo cache variables declared above, before hooks)
 // Find the ComboSkill (type==6) from AbilitySystem.m_skills List
-static void ResolveComboSkill(void *abilityPtr, int charIdx) {
-  if (!abilityPtr || charIdx < 0 || charIdx >= 4) return;
-  // Re-resolve if abilityPtr changed (character swap)
-  if (g_comboAbilityPtr[charIdx] != abilityPtr) {
-    g_comboSkillObj[charIdx] = nullptr;
-    g_comboAbilityPtr[charIdx] = nullptr;
-  }
-  if (g_comboSkillObj[charIdx]) return; // already resolved
-
-  __try {
-    if (g_offAS_skills < 0) return;
-    void *skillsCol = SReadPtr(abilityPtr, g_offAS_skills);
-    if (!skillsCol) return;
-    void *items = SReadPtr(skillsCol, 0x10); // List._items (fixed Unity layout)
-    int32_t count = SReadInt32(skillsCol, 0x18); // List._size (fixed)
-    if (!items || count <= 0 || count > 50) return;
-
-    for (int si = 0; si < count && si < 30; si++) {
-      void *skill = SReadPtr(items, 0x20 + si * 8); // Array data offset (fixed)
-      if (!skill) continue;
-      void *k = il2cpp_object_get_class(skill);
-      const char *cn = k ? il2cpp_class_get_name(k) : "";
-      if (strcmp(cn, "Skill") != 0) continue;
-      int32_t stype = (g_offSkill_type >= 0) ? SReadInt32(skill, g_offSkill_type) : -1;
-      if (stype == 6) { // ComboSkill
-        g_comboSkillObj[charIdx] = skill;
-        g_comboAbilityPtr[charIdx] = abilityPtr;
-        float cdTot = g_mSkillGetCooldown ?
-            SInvokeFloat(g_mSkillGetCooldown, skill) : 0.0f;
-        static void *s_lastLoggedSkill[4] = {};
-        if (s_lastLoggedSkill[charIdx] != skill) {
-          s_lastLoggedSkill[charIdx] = skill;
-          Log("[SkillHUD] ComboSkill found for char=%d obj=%p cdTotal=%.1f",
-              charIdx, skill, cdTot);
-        }
-        return;
-      }
-    }
-  } __except(1) {}
-}
-
-// Read combo CD every frame
+// Reacquire the skill from THIS callback's AbilitySystem. No managed object
+// reference survives the callback, including when a pooled object is reused.
 static void ReadComboCd(void *abilityPtr, int charIdx) {
   if (charIdx < 0 || charIdx >= 4) return;
-
-  ResolveComboSkill(abilityPtr, charIdx);
-
-  void *skill = g_comboSkillObj[charIdx];
-  if (skill && g_mSkillGetCdRemaining && g_mSkillGetCooldown) {
-    float cdRem = SInvokeFloat(g_mSkillGetCdRemaining, skill);
-    float cdTot = SInvokeFloat(g_mSkillGetCooldown, skill);
-    g_comboState[charIdx].cooldown = cdRem;
-    g_comboState[charIdx].maxCooldown = cdTot;
-    g_comboState[charIdx].ready = (cdRem <= 0.01f);
-    g_comboState[charIdx].valid = true;
-    g_comboState[charIdx].isEmpty = false;
-  } else {
-    g_comboState[charIdx].valid = false;
+  g_comboState[charIdx] = {};
+  if (!abilityPtr || g_offAS_skills < 0) return;
+  void *skills = SReadPtr(abilityPtr, g_offAS_skills);
+  void *items = skills ? SReadPtr(skills, 0x10) : nullptr;
+  int count = skills ? SReadInt32(skills, 0x18) : 0;
+  if (!items || count < 0 || count > 50) return;
+  for (int i = 0; i < count; ++i) {
+    void *skill = SReadPtr(items, 0x20 + i * 8);
+    if (!skill) continue;
+    void* klass = il2cpp_object_get_class(skill);
+    const char* name = klass ? il2cpp_class_get_name(klass) : nullptr;
+    if (!name || strcmp(name, "Skill") || g_offSkill_type < 0 ||
+        SReadInt32(skill, g_offSkill_type) != 6) continue;
+    auto& state = g_comboState[charIdx];
+    state.cooldown = SInvokeFloat(g_mSkillGetCdRemaining, skill);
+    state.maxCooldown = SInvokeFloat(g_mSkillGetCooldown, skill);
+    state.ready = state.cooldown <= 0.01f;
+    state.valid = g_mSkillGetCdRemaining && g_mSkillGetCooldown;
+    state.isEmpty = false;
+    break;
   }
 }
 
-void hkSkillBtnPreTick(void *self, void *deltaTime, void *methodInfo) {
+void hkSkillBtnPreTick(void *self, float deltaTime, void *methodInfo) {
   // Call original first — always, for game stability
   oSkillBtnPreTick(self, deltaTime, methodInfo);
+  if (!GameReadAllowed()) return;
 
   __try {
     if (g_offSB_charIndex < 0) return; // offsets not resolved yet
@@ -323,10 +298,9 @@ void hkSkillBtnPreTick(void *self, void *deltaTime, void *methodInfo) {
 
     // Throttle: only update HUD data ~30fps per character slot.
     // At 200fps this reduces il2cpp_runtime_invoke calls from 3200/s to ~480/s.
-    static DWORD s_lastUpdate[4] = {};
     DWORD now = GetTickCount();
-    if (now - s_lastUpdate[charIdx] < 33) return;
-    s_lastUpdate[charIdx] = now;
+    if (now - g_lastSkillUpdate[charIdx] < 33) return;
+    g_lastSkillUpdate[charIdx] = now;
 
     bool empty = (g_offSB_isEmpty >= 0) ? SReadBool(self, g_offSB_isEmpty) : false;
 
@@ -378,10 +352,13 @@ void hkSkillBtnPreTick(void *self, void *deltaTime, void *methodInfo) {
 
 // ============================================================================
 // Init: Resolve classes & methods, install hooks
-// Called from MainThread after MH_Initialize
+// Called during APH_Enable on the metadata worker
 // ============================================================================
 static bool InitSkillHooks(void **assemblies, size_t count) {
-  InitializeCriticalSection(&g_skillLock);
+
+  void* behaviour = FindClass("UnityEngine", "Behaviour", assemblies, count);
+  g_panelActiveMethod = FindMethod(behaviour, "get_isActiveAndEnabled", 0);
+  if (!ValidateMethod(g_panelActiveMethod, "System.Boolean", {})) return false;
 
   // 1. Find SkillButton class and hook PreTick
   void *skillBtnClass = FindClass("Beyond.UI", "SkillButton", assemblies, count);
@@ -397,8 +374,8 @@ static bool InitSkillHooks(void **assemblies, size_t count) {
     return false;
   }
 
-  Hook(preTickMethod, "SkillBtnPreTick", (void *)hkSkillBtnPreTick,
-       (void **)&oSkillBtnPreTick);
+  if (!QueueHudHook<SkillTickHook>(preTickMethod, 9, "SkillBtnPreTick", hkSkillBtnPreTick,
+        "void(self,f32,MethodInfo*)", {"System.Single"})) return false;
 
   // 2. Resolve SkillButton field offsets dynamically
   g_offSB_charIndex = FindField(skillBtnClass, "m_charIndex");
@@ -417,11 +394,14 @@ static bool InitSkillHooks(void **assemblies, size_t count) {
   if (skillClass) {
     g_mSkillGetCdRemaining = FindMethod(skillClass, "get_cdRemainingTime", 0);
     g_mSkillGetCooldown = FindMethod(skillClass, "get_cooldown", 0);
+    if (!ValidateMethod(g_mSkillGetCdRemaining, "System.Single", {}) ||
+        !ValidateMethod(g_mSkillGetCooldown, "System.Single", {})) return false;
     g_offSkill_type = FindField(skillClass, "<skillType>k__BackingField");
     Log("[SkillHUD] Skill.get_cdRemainingTime=%p, get_cooldown=%p, typeOffset=0x%X",
         g_mSkillGetCdRemaining, g_mSkillGetCooldown, g_offSkill_type);
   } else {
     Log("[SkillHUD] Skill class not found");
+    return false;
   }
 
   // 4. Find AbilitySystem and resolve m_skills offset
@@ -431,6 +411,7 @@ static bool InitSkillHooks(void **assemblies, size_t count) {
     Log("[SkillHUD] AbilitySystem.m_skills offset=0x%X", g_offAS_skills);
   } else {
     Log("[SkillHUD] AbilitySystem class not found");
+    return false;
   }
 
   // 5. Hook MainCharHpBar.OnShow / OnHide for battle detection
@@ -455,31 +436,34 @@ static bool InitSkillHooks(void **assemblies, size_t count) {
       DumpFieldsHierarchy(hpBarClass);
     }
     void *showMethod = FindMethod(hpBarClass, "OnShow", 0);
-    if (showMethod)
-      Hook(showMethod, "HpBarOnShow", (void *)hkHpBarOnShow,
-           (void **)&oHpBarOnShow);
+    if (!QueueHudHook<ShowHook>(showMethod, 10, "HpBarOnShow", hkHpBarOnShow,
+        "void(self,MethodInfo*)", {})) return false;
     void *hideMethod = FindMethod(hpBarClass, "OnHide", 0);
-    if (hideMethod)
-      Hook(hideMethod, "HpBarOnHide", (void *)hkHpBarOnHide,
-           (void **)&oHpBarOnHide);
+    if (!QueueHudHook<HideHook>(hideMethod, 11, "HpBarOnHide", hkHpBarOnHide,
+        "void(self,MethodInfo*)", {})) return false;
   }
 
   // 6. Hook ComboSkillPanel for actual combat detection
   void *comboPanelClass = FindClass("Beyond.UI", "ComboSkillPanel", assemblies, count);
   if (comboPanelClass) {
     Log("[SkillHUD] ComboSkillPanel class: %p", comboPanelClass);
+    void* tick = FindMethod(comboPanelClass, "PreTick", 1);
+    if (!QueueHudHook<ComboTickHook>(tick, 14, "ComboPanelPreTick", hkComboPanelTick,
+        "void(self,f32,MethodInfo*)", {"System.Single"})) return false;
     void *btcMethod = FindMethod(comboPanelClass, "_OnBattleTeamChanged", 0);
-    if (btcMethod)
-      Hook(btcMethod, "ComboPanelBattleChanged", (void *)hkComboPanelBattleChanged,
-           (void **)&oComboPanelBattleChanged);
+    if (!QueueHudHook<BattleHook>(btcMethod, 12, "ComboPanelBattleChanged", hkComboPanelBattleChanged,
+        "void(self,MethodInfo*)", {})) return false;
     void *relMethod = FindMethod(comboPanelClass, "OnRelease", 0);
-    if (relMethod)
-      Hook(relMethod, "ComboPanelRelease", (void *)hkComboPanelRelease,
-           (void **)&oComboPanelRelease);
+    if (!QueueHudHook<ReleaseHook>(relMethod, 13, "ComboPanelRelease", hkComboPanelRelease,
+        "void(self,MethodInfo*)", {})) return false;
   } else {
     Log("[SkillHUD] ComboSkillPanel not found");
+    return false;
   }
 
+  if (!hpBarClass || g_offAS_skills < 0 || g_offSkill_type < 0 ||
+      g_offSB_charIndex < 0 || g_offSB_isEmpty < 0 || g_offSB_abilityPtr < 0 ||
+      g_offSB_uspFill < 0) return false;
   Log("[SkillHUD] Hooks installed successfully");
   return true;
 }
@@ -502,7 +486,7 @@ static int   s_skillLastH = 0;
 
 static void DrawSkillHud(HDC hdc, HWND hwnd) {
   // Toggle check: user can hide skill HUD via F11
-  if (!g_showSkillHud) return;
+  if (!g_showSkillHud || !g_pluginActive || !RuntimeOpen()) return;
 
   // Check if data is valid and recent (within 3 seconds)
   SkillHudState local;
@@ -514,7 +498,7 @@ static void DrawSkillHud(HDC hdc, HWND hwnd) {
 
   // Only show HUD when scene is active and CanvasGroup alpha is sufficient
   // (g_cgAlpha is updated by hkLateTick on the game thread — thread-safe read)
-  if (!g_sceneActive) return;
+  if (!g_sceneActive || GetTickCount() - g_lastHpTick.load() > 1500) return;
   if (g_cgAlpha < 0.1f) return;
 
   // Use game window dimensions for layout (overlay may be smaller due to content-tight sizing)

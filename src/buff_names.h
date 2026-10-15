@@ -3,7 +3,7 @@
 // Since int_id is not available in client memory, we use buff string IDs.
 
 // Forward declaration: language flag defined in combat_hud.cpp
-extern volatile bool g_langZh;
+extern std::atomic<bool> g_langZh;
 
 // ============================================================================
 // Character code -> name mapping (from CharacterNameIndex.json)

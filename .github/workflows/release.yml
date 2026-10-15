@@ -19,14 +19,11 @@ jobs:
     - name: Build Project
       run: |
         cmd /c build.bat
+        if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
     - name: Package Release
       run: |
-        mkdir release_pkg
-        copy bin\EndfieldCombatHUD.dll release_pkg\
-        copy bin\d3dcompiler_47.dll release_pkg\
-        copy bin\vulkan-1.dll release_pkg\
-        Compress-Archive -Path release_pkg\* -DestinationPath "EndfieldCombatHUD_${{ github.ref_name }}.zip"
+        Compress-Archive -Path bin\EndfieldCombatHUD.dll -DestinationPath "EndfieldCombatHUD_${{ github.ref_name }}.zip"
 
     - name: Publish to GitHub Releases
       uses: softprops/action-gh-release@v2
